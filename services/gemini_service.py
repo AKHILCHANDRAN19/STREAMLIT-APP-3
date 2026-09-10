@@ -14,7 +14,8 @@ logger = logging.getLogger("Gemini_Service")
 async def init_gemini_client() -> GeminiClient:
   """Initializes and returns an authenticated Gemini WebAPI client."""
   psid, psidts = get_gemini_credentials()
-  client = GeminiClient(psid, psidts, proxy=None)
+  # Do not pass proxy into init(); GeminiClient accepts (psid, psidts) directly
+  client = GeminiClient(psid, psidts)
   await client.init(
       timeout=45, auto_close=False, close_delay=300, auto_refresh=True
   )
@@ -39,7 +40,7 @@ async def analyze_document_title(chat, first_page_img: str) -> str:
 async def extract_table_of_contents(
     chat, image_paths: list[str]
 ) -> PDFAnalysis:
-  """Scans first 15 pages to locate the Index/TOC and compute the mathematical page offset."""
+  """Scans first 15 pages to locate the Index/TOC and compute page offset."""
   schema_json = json.dumps(PDFAnalysis.model_json_schema(), indent=2)
   prompt = f"""
     Analyze these uploaded document preview pages.
