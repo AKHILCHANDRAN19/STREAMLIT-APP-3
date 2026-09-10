@@ -5,6 +5,6 @@ aiofiles
 pymupdf
 pydantic
 weasyprint
-gemini_webapi
+gemini-webapi>=2.1.1
 Pillow
 requests
