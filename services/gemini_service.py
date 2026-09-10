@@ -14,17 +14,25 @@ logger = logging.getLogger("Gemini_Service")
 
 
 async def init_gemini_client() -> GeminiClient:
-  """Initializes Gemini WebAPI client matching the working Hugging Face configuration."""
-  psid, psidts = get_gemini_credentials()
+  """Initializes GeminiClient using HanaokaYuzu/Gemini-API official specifications."""
+  psid, psidts, full_cookies = get_gemini_credentials()
 
-  # Set cookie cache directory exactly like in app.py
+  # Set session cache directory
   cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
   cache_dir.mkdir(parents=True, exist_ok=True)
   os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
 
-  # Pass proxy=None in constructor; omit auto_refresh=True
+  # Official constructor: GeminiClient(Secure_1PSID, Secure_1PSIDTS, proxy=None)
   client = GeminiClient(psid, psidts or "", proxy=None)
-  await client.init(timeout=30, auto_close=False, close_delay=300)
+
+  # Inject full cookie jar to authenticate without requiring __Secure-1PSIDTS
+  for name, val in full_cookies.items():
+    client.cookies[name] = val
+
+  # Disable auto_refresh so it won't crash when __Secure-1PSIDTS is empty
+  await client.init(
+      timeout=30, auto_close=False, close_delay=300, auto_refresh=False
+  )
   return client
 
 
