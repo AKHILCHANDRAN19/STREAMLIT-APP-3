@@ -12,10 +12,9 @@ logger = logging.getLogger("Gemini_Service")
 
 
 async def init_gemini_client() -> GeminiClient:
-  """Initializes and returns an authenticated Gemini WebAPI client."""
+  """Initializes and authenticates the Gemini WebAPI client without invalid parameters."""
   psid, psidts = get_gemini_credentials()
-  # Do not pass proxy into init(); GeminiClient accepts (psid, psidts) directly
-  client = GeminiClient(psid, psidts)
+  client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
   await client.init(
       timeout=45, auto_close=False, close_delay=300, auto_refresh=True
   )
@@ -23,7 +22,7 @@ async def init_gemini_client() -> GeminiClient:
 
 
 async def analyze_document_title(chat, first_page_img: str) -> str:
-  """Extracts a short 3-4 word title for document naming."""
+  """Generates a concise 3-4 word title from page 1."""
   prompt = (
       "Analyze this page. Create a very short, catchy title (maximum 3 to 4"
       " words) in English. Do NOT use underscores. Output ONLY the title."
@@ -33,14 +32,14 @@ async def analyze_document_title(chat, first_page_img: str) -> str:
     clean_title = re.sub(r"[^a-zA-Z0-9\s]", "", resp.text.strip())
     return " ".join(clean_title.split()) or "Document_Output"
   except Exception as e:
-    logger.warning(f"Title generation failed: {e}. Using fallback.")
+    logger.warning(f"Title analysis fallback triggered: {e}")
     return "Document_Output"
 
 
 async def extract_table_of_contents(
     chat, image_paths: list[str]
 ) -> PDFAnalysis:
-  """Scans first 15 pages to locate the Index/TOC and compute page offset."""
+  """Scans initial preview images to detect the index/TOC and calculate mathematical page offset."""
   schema_json = json.dumps(PDFAnalysis.model_json_schema(), indent=2)
   prompt = f"""
     Analyze these uploaded document preview pages.
@@ -63,7 +62,7 @@ async def extract_table_of_contents(
 async def verify_chapter_page(
     chat, img_path: str, chap_num: int, chap_name: str
 ) -> bool:
-  """Performs single-page visual verification before PDF slicing."""
+  """Performs visual header verification on single candidate page before physical slicing."""
   prompt = f"""
     Look at this single uploaded page.
     Does this page contain the starting title/heading for Chapter {chap_num}: '{chap_name}'?
@@ -83,10 +82,10 @@ async def generate_mcqs_for_page(
     doc_type: str = "pointwise",
     max_retries: int = 3,
 ) -> PageMCQOutput:
-  """Processes a single page image inside an active chat session to generate MCQs."""
+  """Analyzes a single page image and generates dedicated practice MCQs."""
   schema_json = json.dumps(PageMCQOutput.model_json_schema(), indent=2)
 
-  # Phase 1: Count Target Questions
+  # Phase 1: Fact Counting
   count_prompt = f"""
     Analyze Page {page_num} attached. 
     Count the distinct factual statements, definitions, vocabulary pairs, or table rows on this page.
@@ -99,8 +98,8 @@ async def generate_mcqs_for_page(
     target_mcqs = decoded_count.get("max_potential_mcqs", 0) + EXTRA_MCQS
   except Exception as e:
     logger.warning(
-        f"Counting phase failed on page {page_num}: {e}. Using target"
-        f" {target_mcqs}"
+        f"Counting phase failed on page {page_num}: {e}. Defaulting to"
+        f" target {target_mcqs}"
     )
 
   await asyncio.sleep(1)
@@ -110,7 +109,7 @@ async def generate_mcqs_for_page(
     Generate exactly {target_mcqs} comprehensive MCQs strictly originating from this uploaded page (Page {page_num}).
 
     RULES:
-    1. If words have multiple synonyms/antonyms/facts, test them from different angles without word-for-word duplication.
+    1. If concepts, vocabulary, or relations have multiple variants, test them from different angles without word-for-word duplication.
     2. Write question stems, choices A, B, C, D, answer_text, and source_sentence in the native language of the source text.
     3. Ensure no trailing commas. Set 'page_number' to {page_num}.
 
