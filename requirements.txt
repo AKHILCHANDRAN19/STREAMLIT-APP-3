@@ -1,0 +1,10 @@
+streamlit
+pyrofork
+tgcrypto
+aiofiles
+pymupdf
+pydantic
+weasyprint
+gemini_webapi
+Pillow
+requests
