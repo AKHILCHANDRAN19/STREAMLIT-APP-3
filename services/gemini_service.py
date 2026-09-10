@@ -1,60 +1,48 @@
-import asyncio
+import os
+import re
 import json
 import logging
-import os
 import pathlib
-import re
-from config import DELAY_BETWEEN_PAGES, DOWNLOAD_DIR, EXTRA_MCQS, get_gemini_credentials
+import asyncio
 from gemini_webapi import GeminiClient
 from models import PageMCQOutput, PDFAnalysis, WebAPIPageExtraction
 from utils.json_cleaner import robust_json_decode
 from utils.text_cleaner import clean_markdown_artifacts
+from config import get_gemini_credentials, EXTRA_MCQS, DELAY_BETWEEN_PAGES, DOWNLOAD_DIR
 
 logger = logging.getLogger("Gemini_Service")
 
-
 async def init_gemini_client() -> GeminiClient:
-  """Initializes GeminiClient using HanaokaYuzu/Gemini-API official specifications."""
-  psid, psidts, full_cookies = get_gemini_credentials()
+    """Initializes GeminiClient with proxy in the constructor, NOT in client.init()."""
+    psid, psidts, full_cookies = get_gemini_credentials()
 
-  # Set session cache directory
-  cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
-  cache_dir.mkdir(parents=True, exist_ok=True)
-  os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
+    cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
 
-  # Official constructor: GeminiClient(Secure_1PSID, Secure_1PSIDTS, proxy=None)
-  client = GeminiClient(psid, psidts or "", proxy=None)
+    # proxy goes in GeminiClient(...), NOT client.init(...)
+    client = GeminiClient(psid, psidts or "", proxy=None)
 
-  # Inject full cookie jar to authenticate without requiring __Secure-1PSIDTS
-  for name, val in full_cookies.items():
-    client.cookies[name] = val
+    for name, val in full_cookies.items():
+        client.cookies[name] = val
 
-  # Disable auto_refresh so it won't crash when __Secure-1PSIDTS is empty
-  await client.init(
-      timeout=30, auto_close=False, close_delay=300, auto_refresh=False
-  )
-  return client
-
+    # Strict: do not pass proxy here
+    await client.init(timeout=30, auto_close=False, close_delay=300, auto_refresh=False)
+    return client
 
 async def analyze_document_title(chat, first_page_img: str) -> str:
-  prompt = (
-      "Analyze this page. Create a very short, catchy title (maximum 3 to 4"
-      " words) in English. Do NOT use underscores. Output ONLY the title."
-  )
-  try:
-    resp = await chat.send_message(prompt, files=[first_page_img])
-    clean_title = re.sub(r"[^a-zA-Z0-9\s]", "", resp.text.strip())
-    return " ".join(clean_title.split()) or "Document_Output"
-  except Exception as e:
-    logger.warning(f"Title analysis fallback: {e}")
-    return "Document_Output"
+    prompt = "Analyze this page. Create a very short, catchy title (maximum 3 to 4 words) in English. Do NOT use underscores. Output ONLY the title."
+    try:
+        resp = await chat.send_message(prompt, files=[first_page_img])
+        clean_title = re.sub(r'[^a-zA-Z0-9\s]', '', resp.text.strip())
+        return " ".join(clean_title.split()) or "Document_Output"
+    except Exception as e:
+        logger.warning(f"Title analysis fallback: {e}")
+        return "Document_Output"
 
-
-async def extract_table_of_contents(
-    chat, image_paths: list[str]
-) -> PDFAnalysis:
-  schema_json = json.dumps(PDFAnalysis.model_json_schema(), indent=2)
-  prompt = f"""
+async def extract_table_of_contents(chat, image_paths: list[str]) -> PDFAnalysis:
+    schema_json = json.dumps(PDFAnalysis.model_json_schema(), indent=2)
+    prompt = f"""
     Analyze these uploaded document preview pages.
     Image 0 corresponds to Physical Page Index 0, Image 1 to Index 1, etc.
 
@@ -67,54 +55,41 @@ async def extract_table_of_contents(
     Return raw JSON matching this schema only:
     {schema_json}
     """
-  resp = await chat.send_message(prompt, files=image_paths)
-  decoded = robust_json_decode(resp.text)
-  return PDFAnalysis.model_validate(decoded)
+    resp = await chat.send_message(prompt, files=image_paths)
+    decoded = robust_json_decode(resp.text)
+    return PDFAnalysis.model_validate(decoded)
 
-
-async def verify_chapter_page(
-    chat, img_path: str, chap_num: int, chap_name: str
-) -> bool:
-  prompt = f"""
+async def verify_chapter_page(chat, img_path: str, chap_num: int, chap_name: str) -> bool:
+    prompt = f"""
     Look at this single uploaded page.
     Does this page contain the starting title/heading for Chapter {chap_num}: '{chap_name}'?
     Reply STRICTLY with only 'YES' or 'NO'.
     """
-  try:
-    resp = await chat.send_message(prompt, files=[img_path])
-    return "YES" in resp.text.strip().upper()
-  except Exception:
-    return False
+    try:
+        resp = await chat.send_message(prompt, files=[img_path])
+        return "YES" in resp.text.strip().upper()
+    except Exception:
+        return False
 
-
-async def generate_mcqs_for_page(
-    chat,
-    page_img: str,
-    page_num: int,
-    doc_type: str = "pointwise",
-    max_retries: int = 3,
-) -> PageMCQOutput:
-  schema_json = json.dumps(PageMCQOutput.model_json_schema(), indent=2)
-
-  count_prompt = f"""
+async def generate_mcqs_for_page(chat, page_img: str, page_num: int, doc_type: str = "pointwise", max_retries: int = 3) -> PageMCQOutput:
+    schema_json = json.dumps(PageMCQOutput.model_json_schema(), indent=2)
+    
+    count_prompt = f"""
     Analyze Page {page_num} attached. 
     Count the distinct factual statements, definitions, vocabulary pairs, or table rows on this page.
     Return ONLY a JSON object: {{"max_potential_mcqs": 0}}
     """
-  target_mcqs = EXTRA_MCQS
-  try:
-    count_resp = await chat.send_message(count_prompt, files=[page_img])
-    decoded_count = robust_json_decode(count_resp.text, page_num)
-    target_mcqs = decoded_count.get("max_potential_mcqs", 0) + EXTRA_MCQS
-  except Exception as e:
-    logger.warning(
-        f"Counting phase fallback on page {page_num}: {e}. Target:"
-        f" {target_mcqs}"
-    )
+    target_mcqs = EXTRA_MCQS
+    try:
+        count_resp = await chat.send_message(count_prompt, files=[page_img])
+        decoded_count = robust_json_decode(count_resp.text, page_num)
+        target_mcqs = decoded_count.get("max_potential_mcqs", 0) + EXTRA_MCQS
+    except Exception as e:
+        logger.warning(f"Counting phase fallback on page {page_num}: {e}. Target: {target_mcqs}")
 
-  await asyncio.sleep(1)
+    await asyncio.sleep(1)
 
-  gen_prompt = f"""
+    gen_prompt = f"""
     Generate exactly {target_mcqs} comprehensive MCQs strictly originating from this uploaded page (Page {page_num}).
 
     RULES:
@@ -127,28 +102,23 @@ async def generate_mcqs_for_page(
     {schema_json}
     """
 
-  for attempt in range(1, max_retries + 1):
-    try:
-      resp = await chat.send_message(gen_prompt)
-      decoded = robust_json_decode(resp.text, page_num)
-      validated = PageMCQOutput.model_validate(decoded)
-      validated.page_number = page_num
-      return validated
-    except Exception as e:
-      logger.warning(
-          f"MCQ attempt {attempt} failed on page {page_num}: {e}"
-      )
-      if attempt < max_retries:
-        await asyncio.sleep(DELAY_BETWEEN_PAGES)
-      else:
-        return PageMCQOutput(page_number=page_num, mcqs=[])
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = await chat.send_message(gen_prompt)
+            decoded = robust_json_decode(resp.text, page_num)
+            validated = PageMCQOutput.model_validate(decoded)
+            validated.page_number = page_num
+            return validated
+        except Exception as e:
+            logger.warning(f"MCQ attempt {attempt} failed on page {page_num}: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(DELAY_BETWEEN_PAGES)
+            else:
+                return PageMCQOutput(page_number=page_num, mcqs=[])
 
-
-async def extract_text_and_tables_webapi(
-    client: GeminiClient, img_path: str, page_num: int
-) -> WebAPIPageExtraction:
-  schema_json = json.dumps(WebAPIPageExtraction.model_json_schema(), indent=2)
-  prompt = f"""
+async def extract_text_and_tables_webapi(client: GeminiClient, img_path: str, page_num: int) -> WebAPIPageExtraction:
+    schema_json = json.dumps(WebAPIPageExtraction.model_json_schema(), indent=2)
+    prompt = f"""
     Analyze this page image (Page {page_num}). Extract all paragraphs and tables.
     Do NOT summarize. Do not use markdown headers (no ###) or asterisks.
     For tables, duplicate merged cells into corresponding rows so data is preserved.
@@ -158,13 +128,11 @@ async def extract_text_and_tables_webapi(
     Return raw JSON matching this schema only:
     {schema_json}
     """
-  try:
-    resp = await client.generate_content(
-        prompt, model="gemini-3-flash", files=[img_path]
-    )
-    decoded = robust_json_decode(resp.text, page_num)
-    return WebAPIPageExtraction.model_validate(decoded)
-  except Exception as e:
-    logger.error(f"Text/Table extraction error on page {page_num}: {e}")
-    return WebAPIPageExtraction(page_number=page_num, blocks=[])
+    try:
+        resp = await client.generate_content(prompt, model="gemini-3-flash", files=[img_path])
+        decoded = robust_json_decode(resp.text, page_num)
+        return WebAPIPageExtraction.model_validate(decoded)
+    except Exception as e:
+        logger.error(f"Text/Table extraction error on page {page_num}: {e}")
+        return WebAPIPageExtraction(page_number=page_num, blocks=[])
 
