@@ -4,6 +4,7 @@ import logging
 import os
 import pathlib
 import re
+import sys
 from config import DELAY_BETWEEN_PAGES, DOWNLOAD_DIR, EXTRA_MCQS, get_gemini_credentials
 from gemini_webapi import GeminiClient
 from models import PageMCQOutput, PDFAnalysis, WebAPIPageExtraction
@@ -13,22 +14,38 @@ from utils.text_cleaner import clean_markdown_artifacts
 logger = logging.getLogger("Gemini_Service")
 
 
+def log_step(msg: str):
+  """Forces real-time flushing directly to Streamlit Cloud container logs."""
+  print(f"[GEMINI API] {msg}", flush=True)
+  logger.info(msg)
+
+
 async def init_gemini_client() -> GeminiClient:
-  """Exact working client initialization - UNTOUCHED."""
+  """Initializes GeminiClient with real-time handshake logging."""
   psid, psidts, _ = get_gemini_credentials()
 
   cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
   cache_dir.mkdir(parents=True, exist_ok=True)
   os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
 
+  masked_psid = (
+      f"{psid[:10]}...{psid[-6:]}" if len(psid) > 16 else "VALID_TOKEN"
+  )
+  log_step(
+      f"Connecting session with 1PSID: {masked_psid} | 1PSIDTS Present:"
+      f" {bool(psidts)}"
+  )
+
   client = GeminiClient(psid, psidts or "")
   await client.init(
       timeout=45, auto_close=False, close_delay=300, auto_refresh=False
   )
+  log_step("Handshake successful. Gemini WebAPI session is online.")
   return client
 
 
 async def analyze_document_title(chat, first_page_img: str) -> str:
+  log_step(f"Analyzing title from page preview: {first_page_img}")
   prompt = (
       "Analyze this page. Create a very short, catchy title (maximum 3 to 4"
       " words) in the primary language of the document. Do NOT use underscores."
@@ -37,15 +54,20 @@ async def analyze_document_title(chat, first_page_img: str) -> str:
   try:
     resp = await chat.send_message(prompt, files=[first_page_img])
     clean_title = re.sub(r"[^\w\s]", "", resp.text.strip())
-    return " ".join(clean_title.split()) or "Document_Output"
+    final_title = " ".join(clean_title.split()) or "Document_Output"
+    log_step(f"Document title detected: '{final_title}'")
+    return final_title
   except Exception as e:
-    logger.warning(f"Title analysis fallback: {e}")
+    log_step(f"Title fallback triggered due to: {e}")
     return "Document_Output"
 
 
 async def extract_table_of_contents(
     chat, image_paths: list[str]
 ) -> PDFAnalysis:
+  log_step(
+      f"Extracting Table of Contents from {len(image_paths)} preview pages..."
+  )
   schema_json = json.dumps(PDFAnalysis.model_json_schema(), indent=2)
   prompt = f"""
     Analyze these uploaded document preview pages.
@@ -61,13 +83,25 @@ async def extract_table_of_contents(
     {schema_json}
     """
   resp = await chat.send_message(prompt, files=image_paths)
+  log_step(
+      f"TOC raw response received ({len(resp.text)} chars). Parsing schema..."
+  )
+
   decoded = robust_json_decode(resp.text)
-  return PDFAnalysis.model_validate(decoded)
+  analysis = PDFAnalysis.model_validate(decoded)
+  log_step(
+      f"TOC Parsed: Found {len(analysis.chapters)} chapters (Offset:"
+      f" {analysis.offset})"
+  )
+  return analysis
 
 
 async def verify_chapter_page(
     chat, img_path: str, chap_num: int, chap_name: str
 ) -> bool:
+  log_step(
+      f"Verifying starting page for Chapter {chap_num} ('{chap_name}')..."
+  )
   prompt = f"""
     Look at this single uploaded page.
     Does this page contain the starting title/heading for Chapter {chap_num}: '{chap_name}'?
@@ -75,8 +109,13 @@ async def verify_chapter_page(
     """
   try:
     resp = await chat.send_message(prompt, files=[img_path])
-    return "YES" in resp.text.strip().upper()
-  except Exception:
+    is_start = "YES" in resp.text.strip().upper()
+    log_step(
+        f"Chapter {chap_num} verification result: {'CONFIRMED (YES)' if is_start else 'REJECTED (NO)'}"
+    )
+    return is_start
+  except Exception as e:
+    log_step(f"Chapter verification error on Chapter {chap_num}: {e}")
     return False
 
 
@@ -89,25 +128,32 @@ async def generate_mcqs_for_page(
 ) -> PageMCQOutput:
   schema_json = json.dumps(PageMCQOutput.model_json_schema(), indent=2)
 
+  # Phase 1: Fact Counting
   count_prompt = f"""
     Analyze Page {page_num} attached. 
     Count the distinct factual statements, definitions, vocabulary pairs, or table rows on this page.
     Return ONLY a JSON object: {{"max_potential_mcqs": 0}}
     """
   target_mcqs = EXTRA_MCQS
+  log_step(f"[Page {page_num}] Scanning facts for question estimation...")
+
   try:
     count_resp = await chat.send_message(count_prompt, files=[page_img])
     decoded_count = robust_json_decode(count_resp.text, page_num)
     target_mcqs = decoded_count.get("max_potential_mcqs", 0) + EXTRA_MCQS
-  except Exception as e:
-    logger.warning(
-        f"Counting phase fallback on page {page_num}: {e}. Target:"
+    log_step(
+        f"[Page {page_num}] Potential facts detected. Target MCQs set to:"
         f" {target_mcqs}"
+    )
+  except Exception as e:
+    log_step(
+        f"[Page {page_num}] Fact estimation fallback: {e}. Defaulting to"
+        f" {target_mcqs} MCQs"
     )
 
   await asyncio.sleep(1)
 
-  # CRITICAL PROMPT UPDATE: Strict language lock
+  # Phase 2: Synthesis with strict language lock
   gen_prompt = f"""
     CRITICAL LANGUAGE INSTRUCTION:
     1. Detect the primary language of the uploaded document page (e.g., Malayalam, Tamil, Hindi, English).
@@ -131,24 +177,33 @@ async def generate_mcqs_for_page(
 
   for attempt in range(1, max_retries + 1):
     try:
+      log_step(
+          f"[Page {page_num}] Generating MCQs (Attempt {attempt}/{max_retries})..."
+      )
       resp = await chat.send_message(gen_prompt)
       decoded = robust_json_decode(resp.text, page_num)
       validated = PageMCQOutput.model_validate(decoded)
       validated.page_number = page_num
+
+      log_step(
+          f"[Page {page_num}] Successfully validated {len(validated.mcqs)} MCQs"
+          " from response."
+      )
       return validated
     except Exception as e:
-      logger.warning(
-          f"MCQ attempt {attempt} failed on page {page_num}: {e}"
-      )
+      log_step(f"[Page {page_num}] Attempt {attempt} failed: {e}")
       if attempt < max_retries:
+        log_step(f"[Page {page_num}] Sleeping {DELAY_BETWEEN_PAGES}s before retry...")
         await asyncio.sleep(DELAY_BETWEEN_PAGES)
       else:
+        log_step(f"[Page {page_num}] Retries exhausted. Returning empty set.")
         return PageMCQOutput(page_number=page_num, mcqs=[])
 
 
 async def extract_text_and_tables_webapi(
     client: GeminiClient, img_path: str, page_num: int
 ) -> WebAPIPageExtraction:
+  log_step(f"[Page {page_num}] Running vision OCR (gemini-flash-lite)...")[span_1](start_span)[span_1](end_span)
   schema_json = json.dumps(WebAPIPageExtraction.model_json_schema(), indent=2)
   prompt = f"""
     Analyze this page image (Page {page_num}). Extract all paragraphs and tables.
@@ -166,8 +221,10 @@ async def extract_text_and_tables_webapi(
         prompt, model="gemini-flash-lite", files=[img_path]
     )
     decoded = robust_json_decode(resp.text, page_num)
-    return WebAPIPageExtraction.model_validate(decoded)
+    data = WebAPIPageExtraction.model_validate(decoded)
+    log_step(f"[Page {page_num}] Extracted {len(data.blocks)} text/table blocks.")
+    return data
   except Exception as e:
-    logger.error(f"Text/Table extraction error on page {page_num}: {e}")
+    log_step(f"[Page {page_num}] Vision OCR error: {e}")
     return WebAPIPageExtraction(page_number=page_num, blocks=[])
 
