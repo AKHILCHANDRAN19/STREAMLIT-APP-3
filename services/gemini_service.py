@@ -14,17 +14,14 @@ logger = logging.getLogger("Gemini_Service")
 
 
 async def init_gemini_client() -> GeminiClient:
-  """Initializes GeminiClient flawlessly without invalid attributes or stripped cookie domains."""
+  """Exact working client initialization - UNTOUCHED."""
   psid, psidts, _ = get_gemini_credentials()
 
   cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
   cache_dir.mkdir(parents=True, exist_ok=True)
   os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
 
-  # Official initialization handles the headers and domains internally
   client = GeminiClient(psid, psidts or "")
-
-  # Pass only supported kwargs to avoid unexpected syntax errors
   await client.init(
       timeout=45, auto_close=False, close_delay=300, auto_refresh=False
   )
@@ -34,11 +31,12 @@ async def init_gemini_client() -> GeminiClient:
 async def analyze_document_title(chat, first_page_img: str) -> str:
   prompt = (
       "Analyze this page. Create a very short, catchy title (maximum 3 to 4"
-      " words) in English. Do NOT use underscores. Output ONLY the title."
+      " words) in the primary language of the document. Do NOT use underscores."
+      " Output ONLY the title."
   )
   try:
     resp = await chat.send_message(prompt, files=[first_page_img])
-    clean_title = re.sub(r"[^a-zA-Z0-9\s]", "", resp.text.strip())
+    clean_title = re.sub(r"[^\w\s]", "", resp.text.strip())
     return " ".join(clean_title.split()) or "Document_Output"
   except Exception as e:
     logger.warning(f"Title analysis fallback: {e}")
@@ -55,7 +53,7 @@ async def extract_table_of_contents(
 
     TASK:
     1. Locate the Table of Contents (Index).
-    2. Extract chapter numbers, chapter names, and their printed page numbers.
+    2. Extract chapter numbers, chapter names (in original script/language), and their printed page numbers.
     3. Calculate 'offset' = Physical Image Index - Printed Page Number.
 
     OUTPUT RESTRICTION:
@@ -109,12 +107,21 @@ async def generate_mcqs_for_page(
 
   await asyncio.sleep(1)
 
+  # CRITICAL PROMPT UPDATE: Strict language lock
   gen_prompt = f"""
+    CRITICAL LANGUAGE INSTRUCTION:
+    1. Detect the primary language of the uploaded document page (e.g., Malayalam, Tamil, Hindi, English).
+    2. You MUST write all question stems, choices (A, B, C, D), answer_text, and source_sentence STRICTLY in the EXACT SAME LANGUAGE as the source text on this page.
+    3. STRICT FORBIDDEN: DO NOT TRANSLATE INTO ENGLISH if the page is in Malayalam or another non-English language.
+       - If the document is in Malayalam, generate all questions and options 100% in Malayalam script (മലയാളത്തിൽ മാത്രം).
+       - If the document is in English, generate in English.
+
+    TASK:
     Generate exactly {target_mcqs} comprehensive MCQs strictly originating from this uploaded page (Page {page_num}).
 
     RULES:
     1. If concepts, vocabulary, or relations have multiple variants, test them from different angles without word-for-word duplication.
-    2. Write question stems, choices A, B, C, D, answer_text, and source_sentence in the native language of the source text.
+    2. Maintain strict factual fidelity to the source page.
     3. Ensure no trailing commas. Set 'page_number' to {page_num}.
 
     OUTPUT RESTRICTION:
@@ -145,6 +152,7 @@ async def extract_text_and_tables_webapi(
   schema_json = json.dumps(WebAPIPageExtraction.model_json_schema(), indent=2)
   prompt = f"""
     Analyze this page image (Page {page_num}). Extract all paragraphs and tables.
+    Do NOT translate. Keep the exact native language script of the document as shown in the image.
     Do NOT summarize. Do not use markdown headers (no ###) or asterisks.
     For tables, duplicate merged cells into corresponding rows so data is preserved.
     Set 'page_number' to {page_num}.
