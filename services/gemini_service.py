@@ -12,45 +12,22 @@ from utils.text_cleaner import clean_markdown_artifacts
 
 logger = logging.getLogger("Gemini_Service")
 
-# Exact User-Agent matching the Firefox Android extraction session
-FIREFOX_UA = (
-    "Mozilla/5.0 (Android; Mobile; rv:135.0) Gecko/135.0 Firefox/135.0"
-)
-
 
 async def init_gemini_client() -> GeminiClient:
-  """Initializes GeminiClient with strict cookie domain mapping and matching browser headers."""
-  psid, psidts, full_cookies = get_gemini_credentials()
+  """Initializes GeminiClient flawlessly without invalid attributes or stripped cookie domains."""
+  psid, psidts, _ = get_gemini_credentials()
 
   cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
   cache_dir.mkdir(parents=True, exist_ok=True)
   os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
 
-  # Initialize official client with extracted credentials
+  # Official initialization handles the headers and domains internally
   client = GeminiClient(psid, psidts or "")
 
-  # Explicitly scope cookies to .google.com with secure=True
-  client.cookies.set("__Secure-1PSID", psid, domain=".google.com", secure=True)
-  if psidts:
-    client.cookies.set(
-        "__Secure-1PSIDTS", psidts, domain=".google.com", secure=True
-    )
-
-  # Set browser headers to prevent Google session-hijacking flags
-  client.headers.update({
-      "User-Agent": FIREFOX_UA,
-      "Accept": (
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-      ),
-      "Accept-Language": "en-US,en;q=0.5",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Sec-Fetch-User": "?1",
-      "Upgrade-Insecure-Requests": "1",
-  })
-
-  await client.init(timeout=35, auto_close=False, close_delay=300)
+  # Pass only supported kwargs to avoid unexpected syntax errors
+  await client.init(
+      timeout=45, auto_close=False, close_delay=300, auto_refresh=False
+  )
   return client
 
 
