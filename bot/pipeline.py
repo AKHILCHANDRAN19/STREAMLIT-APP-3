@@ -24,6 +24,10 @@ from services.pdf_service import (
 
 logger = logging.getLogger("Pipeline_Coordinator")
 
+SUCCESS_STICKER_ID = (
+    "CAACAgIAAxkBAAFDtjVpptva4k-to_n8BKzQg23QeMvSTQACVgADRA3PFxlBkhksr1N3OgQ"
+)
+
 
 async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
   """Executes queued items sequentially and dispatches deliverables."""
@@ -45,6 +49,33 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       file_path = f_info["path"]
       original_name = f_info["name"]
 
+      # ─── 1. ECHO SOURCE PDF BACK FIRST (EXACT NAME & ATTACHED TEXT) ───
+      orig_msg_id = (
+          f_info.get("msg_id")
+          or f_info.get("message_id")
+          or f_info.get("id")
+      )
+      echoed = False
+      if orig_msg_id:
+        try:
+          await client.copy_message(
+              chat_id=user_id, from_chat_id=user_id, message_id=orig_msg_id
+          )
+          echoed = True
+        except Exception as e:
+          logger.warning(f"Could not copy source message: {e}")
+
+      if not echoed and os.path.exists(file_path):
+        try:
+          await client.send_document(
+              chat_id=user_id,
+              document=file_path,
+              file_name=original_name,
+              caption=f_info.get("caption") or None,
+          )
+        except Exception as e:
+          logger.warning(f"Could not send source document: {e}")
+
       item_status = await client.send_message(
           user_id,
           f"🎬 **[{idx}/{total_files}] Processing:** `{original_name}`\n\n⏳"
@@ -63,7 +94,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
             file_path, DOWNLOAD_DIR, max_pages=15
         )
 
-        # Force gemini-flash-lite
         split_chat = gem_client.start_chat(model="gemini-flash-lite")
         print(
             f"[GEMINI API] Split chat locked to: {split_chat.model}", flush=True
@@ -80,6 +110,11 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
           await item_status.edit_text(
               f"❌ Could not find Table of Contents in `{original_name}`."
           )
+          # Send sticker even if skipped so user knows document is finalized
+          try:
+            await client.send_sticker(user_id, SUCCESS_STICKER_ID)
+          except Exception:
+            pass
           continue
 
         await item_status.edit_text(
@@ -139,6 +174,13 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
             os.remove(s_file)
 
         await item_status.delete()
+
+        # ─── 3. SEND SUCCESS STICKER (SPLIT MODE) ───
+        try:
+          await client.send_sticker(user_id, SUCCESS_STICKER_ID)
+        except Exception as e:
+          logger.warning(f"Could not send success sticker: {e}")
+
         continue
 
       # ----------------------------------------------------
@@ -149,6 +191,10 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         await item_status.edit_text(
             f"❌ Unable to read `{original_name}`. Skipping."
         )
+        try:
+          await client.send_sticker(user_id, SUCCESS_STICKER_ID)
+        except Exception:
+          pass
         continue
 
       total_pages = min(total_pages, MAX_PAGES_PER_RUN)
@@ -158,7 +204,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       p1_img = os.path.join(DOWNLOAD_DIR, f"p1_{uuid.uuid4().hex[:6]}.png")
       render_page_image(file_path, 0, p1_img, dpi=150)
 
-      # Force gemini-flash-lite
       active_chat = gem_client.start_chat(model="gemini-flash-lite")
       print(
           f"[GEMINI API] Active chat locked to: {active_chat.model}", flush=True
@@ -290,7 +335,7 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
               caption="🌐 **HTML Fallback (PDF compile skipped).**",
           )
 
-      # Cleanup finished files
+      # Cleanup temporary generated files
       for tmp in [
           file_path,
           out_txt_path,
@@ -305,6 +350,12 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
             pass
 
       await item_status.delete()
+
+      # ─── 3. SEND SUCCESS STICKER (MCQ, TEXT & BOTH MODES) ───
+      try:
+        await client.send_sticker(user_id, SUCCESS_STICKER_ID)
+      except Exception as e:
+        logger.warning(f"Could not send success sticker: {e}")
 
     await status_msg.edit_text("🎉 **Batch Processing Complete!**")
 
