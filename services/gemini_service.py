@@ -5,7 +5,7 @@ import os
 import pathlib
 import re
 import sys
-from config import DELAY_BETWEEN_PAGES, DOWNLOAD_DIR, EXTRA_MCQS, get_gemini_credentials
+from config import DELAY_BETWEEN_PAGES, DOWNLOAD_DIR, EXTRA_MCQS, get_all_gemini_accounts
 from gemini_webapi import GeminiClient
 from models import PageMCQOutput, PDFAnalysis, WebAPIPageExtraction
 from utils.json_cleaner import robust_json_decode
@@ -15,37 +15,78 @@ logger = logging.getLogger("Gemini_Service")
 
 
 def log_step(msg: str):
-  """Forces real-time flushing directly to Streamlit Cloud container logs."""
+  """Forces real-time unbuffered flushing to container logs."""
   print(f"[GEMINI API] {msg}", flush=True)
   logger.info(msg)
 
 
 async def init_gemini_client() -> GeminiClient:
-  """Initializes GeminiClient with real-time handshake logging."""
-  psid, psidts, _ = get_gemini_credentials()
+  """Iterates through all configured Gemini accounts until a working one is authenticated."""
+  accounts = get_all_gemini_accounts()
+  log_step(f"Found {len(accounts)} configured Gemini account(s) to evaluate.")
 
-  cache_dir = pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache"
-  cache_dir.mkdir(parents=True, exist_ok=True)
-  os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
+  last_error = None
 
-  masked_psid = (
-      f"{psid[:10]}...{psid[-6:]}" if len(psid) > 16 else "VALID_TOKEN"
-  )
-  log_step(
-      f"Connecting session with 1PSID: {masked_psid} | 1PSIDTS Present:"
-      f" {bool(psidts)}"
-  )
+  for idx, (psid, psidts) in enumerate(accounts, 1):
+    masked_psid = (
+        f"{psid[:10]}...{psid[-6:]}" if len(psid) > 16 else "VALID_TOKEN"
+    )
+    log_step(
+        f"Testing Account {idx}/{len(accounts)} (1PSID: {masked_psid} |"
+        f" 1PSIDTS: {bool(psidts)})..."
+    )
 
-  client = GeminiClient(psid, psidts or "")
-  await client.init(
-      timeout=45, auto_close=False, close_delay=300, auto_refresh=False
+    # Use isolated cookie directories per account to avoid cache collisions
+    cache_dir = (
+        pathlib.Path(DOWNLOAD_DIR) / "gemini_cookie_cache" / f"acc_{idx}"
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["GEMINI_COOKIE_PATH"] = str(cache_dir)
+
+    client = GeminiClient(psid, psidts or "")
+
+    try:
+      await client.init(
+          timeout=45, auto_close=False, close_delay=300, auto_refresh=False
+      )
+
+      # 1. Check if the internal status was flagged as unauthenticated
+      status = str(getattr(client, "status", "")).upper()
+      if "UNAUTHENTICATED" in status:
+        raise ValueError("Google reported status as UNAUTHENTICATED")
+
+      # 2. Verify account models are accessible
+      models = client.list_models()
+      if not models:
+        raise ValueError(
+            "No models returned (cookies expired or account restricted)"
+        )
+
+      log_step(
+          f"Account {idx} is VALID and AUTHENTICATED! (Available models:"
+          f" {len(models)})"
+      )
+      return client
+
+    except Exception as e:
+      log_step(
+          f"Account {idx} failed validation: {e}. Moving to next account..."
+      )
+      last_error = e
+      try:
+        await client.close()
+      except Exception:
+        pass
+
+  # If loop finishes without returning, all accounts are dead
+  log_step("CRITICAL: All configured Gemini accounts failed authentication!")
+  raise RuntimeError(
+      f"All {len(accounts)} Gemini accounts failed authentication: {last_error}"
   )
-  log_step("Handshake successful. Gemini WebAPI session is online.")
-  return client
 
 
 async def analyze_document_title(chat, first_page_img: str) -> str:
-  log_step(f"Analyzing title from page preview: {first_page_img}")
+  log_step(f"Analyzing title from preview: {first_page_img}")
   prompt = (
       "Analyze this page. Create a very short, catchy title (maximum 3 to 4"
       " words) in the primary language of the document. Do NOT use underscores."
@@ -128,32 +169,27 @@ async def generate_mcqs_for_page(
 ) -> PageMCQOutput:
   schema_json = json.dumps(PageMCQOutput.model_json_schema(), indent=2)
 
-  # Phase 1: Fact Counting
   count_prompt = f"""
     Analyze Page {page_num} attached. 
     Count the distinct factual statements, definitions, vocabulary pairs, or table rows on this page.
     Return ONLY a JSON object: {{"max_potential_mcqs": 0}}
     """
   target_mcqs = EXTRA_MCQS
-  log_step(f"[Page {page_num}] Scanning facts for question estimation...")
+  log_step(f"[Page {page_num}] Estimating target MCQs...")
 
   try:
     count_resp = await chat.send_message(count_prompt, files=[page_img])
     decoded_count = robust_json_decode(count_resp.text, page_num)
     target_mcqs = decoded_count.get("max_potential_mcqs", 0) + EXTRA_MCQS
-    log_step(
-        f"[Page {page_num}] Potential facts detected. Target MCQs set to:"
-        f" {target_mcqs}"
-    )
+    log_step(f"[Page {page_num}] Target MCQs: {target_mcqs}")
   except Exception as e:
     log_step(
-        f"[Page {page_num}] Fact estimation fallback: {e}. Defaulting to"
-        f" {target_mcqs} MCQs"
+        f"[Page {page_num}] Estimation fallback: {e}. Defaulting to"
+        f" {target_mcqs}"
     )
 
   await asyncio.sleep(1)
 
-  # Phase 2: Synthesis with strict language lock
   gen_prompt = f"""
     CRITICAL LANGUAGE INSTRUCTION:
     1. Detect the primary language of the uploaded document page (e.g., Malayalam, Tamil, Hindi, English).
@@ -186,24 +222,23 @@ async def generate_mcqs_for_page(
       validated.page_number = page_num
 
       log_step(
-          f"[Page {page_num}] Successfully validated {len(validated.mcqs)} MCQs"
-          " from response."
+          f"[Page {page_num}] Validated {len(validated.mcqs)} generated MCQs."
       )
       return validated
     except Exception as e:
       log_step(f"[Page {page_num}] Attempt {attempt} failed: {e}")
       if attempt < max_retries:
-        log_step(f"[Page {page_num}] Sleeping {DELAY_BETWEEN_PAGES}s before retry...")
+        log_step(f"[Page {page_num}] Waiting {DELAY_BETWEEN_PAGES}s before retry...")
         await asyncio.sleep(DELAY_BETWEEN_PAGES)
       else:
-        log_step(f"[Page {page_num}] Retries exhausted. Returning empty set.")
+        log_step(f"[Page {page_num}] Retries exhausted. Returning empty output.")
         return PageMCQOutput(page_number=page_num, mcqs=[])
 
 
 async def extract_text_and_tables_webapi(
     client: GeminiClient, img_path: str, page_num: int
 ) -> WebAPIPageExtraction:
-  log_step(f"[Page {page_num}] Running vision OCR (gemini-flash-lite)...")[span_1](start_span)[span_1](end_span)
+  log_step(f"[Page {page_num}] Running vision OCR (gemini-flash-lite)...")
   schema_json = json.dumps(WebAPIPageExtraction.model_json_schema(), indent=2)
   prompt = f"""
     Analyze this page image (Page {page_num}). Extract all paragraphs and tables.
@@ -222,9 +257,9 @@ async def extract_text_and_tables_webapi(
     )
     decoded = robust_json_decode(resp.text, page_num)
     data = WebAPIPageExtraction.model_validate(decoded)
-    log_step(f"[Page {page_num}] Extracted {len(data.blocks)} text/table blocks.")
+    log_step(f"[Page {page_num}] Extracted {len(data.blocks)} blocks.")
     return data
   except Exception as e:
-    log_step(f"[Page {page_num}] Vision OCR error: {e}")
+    log_step(f"[Page {page_num}] Vision OCR failed: {e}")
     return WebAPIPageExtraction(page_number=page_num, blocks=[])
 
