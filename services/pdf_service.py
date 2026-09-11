@@ -74,9 +74,9 @@ def split_pdf_by_verified_chapters(
       out_filename = os.path.join(
           output_dir, f"Chapter_{chap_num}_{safe_name}.pdf"
       )
-      new_doc.save(out_filename)
+      # Compresses streams and strips unreferenced parent objects to keep slices lightweight
+      new_doc.save(out_filename, garbage=3, deflate=True)
       new_doc.close()
       split_files.append(out_filename)
 
   return split_files
-
