@@ -1,228 +1,401 @@
 import asyncio
+import logging
 import os
-import uuid
-from bot.keyboards import (
-    get_doctype_keyboard,
-    get_processing_keyboard,
-    get_split_keyboard,
+import shutil
+from config import DOWNLOAD_DIR, FONT_PATH, OWNER_IDS, TARGET_CHANNEL_ID
+from pyrogram import Client, filters
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
-from bot.pipeline import run_queue_pipeline
-from bot.queue_manager import USER_QUEUE
-from config import DOWNLOAD_DIR, OWNER_IDS
-from pyrogram.types import CallbackQuery, Message
+from services.gemini_service import (
+    analyze_document_title,
+    extract_table_of_contents,
+    extract_text_and_tables_webapi,
+    generate_mcqs_for_page,
+    init_gemini_client,
+    verify_chapter_page,
+)
 from utils.telemetry import GLOBAL_STATE
 
-WELCOME_TEXT = (
-    "🎯 **Welcome to the GenAI Processor Bot** 🎯\n\n"
-    "Powered strictly by modern WebAPI sessions, PyMuPDF, and WeasyPrint.\n\n"
-    "🤖 **Available Commands:**\n"
-    "🔹 `/start` - View guide & reset state\n"
-    "🔹 `/queue` - Check current queued files\n"
-    "🔹 `/done` - Finalize queue & select action\n"
-    "🔹 `/clear` - Empty current queue\n\n"
-    "📥 **How to Use:**\n"
-    "1️⃣ Send one or more `.pdf`, images, or `.txt` files.\n"
-    "2️⃣ Type `/done` or `done`.\n"
-    "3️⃣ Choose Pointwise, Chapter, or Smart Chapter Split."
+logger = logging.getLogger("Bot_Handlers")
+
+SUCCESS_STICKER_ID = (
+    "CAACAgIAAxkBAAFDtjVpptva4k-to_n8BKzQg23QeMvSTQACVgADRA3PFxlBkhksr1N3OgQ"
 )
 
+# User session queue: user_id -> list of queued file dicts
+USER_QUEUES = {}
 
-def is_authorized(user_id: int) -> bool:
-  return (not OWNER_IDS) or (user_id in OWNER_IDS)
+
+def get_user_queue(user_id: int) -> list:
+  if user_id not in USER_QUEUES:
+    USER_QUEUES[user_id] = []
+  return USER_QUEUES[user_id]
 
 
-async def log_incoming_messages(client, message: Message):
-  user_info = f"User {message.from_user.id}" if message.from_user else "Unknown"
-  GLOBAL_STATE.log(
-      f"📩 Incoming: {message.text or '[Media/File]'} from {user_info}"
+# ==========================================
+# 📥 1. TELEGRAM COMMAND HANDLERS
+# ==========================================
+@Client.on_message(filters.command(["start", "help"]) & filters.private)
+async def start_handler(client: Client, message: Message):
+  USER_QUEUES[message.from_user.id] = []
+  welcome_text = (
+      "👋 **Welcome to GenAI Document & MCQ Engine**\n\n"
+      "**Available Commands:**\n"
+      "🔹 Send one or more `.pdf` files.\n"
+      "🔹 `/queue` - Check currently queued files.\n"
+      "🔹 `/done` - Finalize queue & select processing action.\n"
+      "🔹 `/clear` - Empty current queue."
   )
-  message.continue_propagation()
+  await message.reply_text(welcome_text)
 
 
-async def start_cmd(client, message: Message):
-  user_id = message.from_user.id if message.from_user else 0
-  if not is_authorized(user_id):
-    return await message.reply_text("⚠️ **Unauthorized user ID.**")
-  await message.reply_text(WELCOME_TEXT)
+@Client.on_message(filters.command(["clear"]) & filters.private)
+async def clear_handler(client: Client, message: Message):
+  USER_QUEUES[message.from_user.id] = []
+  await message.reply_text("🗑 **Queue cleared successfully.**")
 
 
-async def check_queue_cmd(client, message: Message):
-  user_id = message.from_user.id if message.from_user else 0
-  if not is_authorized(user_id):
+@Client.on_message(filters.command(["queue"]) & filters.private)
+async def view_queue_handler(client: Client, message: Message):
+  queue = get_user_queue(message.from_user.id)
+  if not queue:
+    await message.reply_text("📭 Your queue is currently empty.")
     return
 
-  files = USER_QUEUE.get_files(user_id)
-  if not files:
-    return await message.reply_text(
-        "🫙 **Queue is empty.** Send files to begin."
-    )
-
-  text = f"📊 **Queue Status ({len(files)} files):**\n\n"
-  for idx, f in enumerate(files, 1):
-    text += f"{idx}. `{f['name']}`\n"
-
-  doc_type = USER_QUEUE.get_doc_type(user_id)
-  if not doc_type:
-    text += "\n👉 Please select the document structure:"
-    await message.reply_text(text, reply_markup=get_doctype_keyboard())
-  elif doc_type == "split":
-    text += (
-        "\n📑 **Structure:** `✂️ Smart Split`\n\n👉 Click below to proceed:"
-    )
-    await message.reply_text(text, reply_markup=get_split_keyboard())
-  else:
-    doc_label = (
-        "📌 Pointwise" if doc_type == "pointwise" else "📖 Chapter / Paragraph"
-    )
-    text += f"\n📑 **Structure:** `{doc_label}`\n\n👉 Select processing mode:"
-    await message.reply_text(text, reply_markup=get_processing_keyboard())
+  lines = [f"📂 **Queued Files ({len(queue)}):**"]
+  for idx, item in enumerate(queue, 1):
+    lines.append(f"{idx}. `{item['file_name']}`")
+  await message.reply_text("\n".join(lines))
 
 
-async def done_cmd(client, message: Message):
-  user_id = message.from_user.id if message.from_user else 0
-  if not is_authorized(user_id):
+# ==========================================
+# 📄 2. DOCUMENT RECEIVER (QUEUE INGESTION)
+# ==========================================
+@Client.on_message(filters.document & filters.private)
+async def document_receiver(client: Client, message: Message):
+  if OWNER_IDS and message.from_user.id not in OWNER_IDS:
+    await message.reply_text("⛔ You are not authorized to use this bot.")
     return
 
-  files = USER_QUEUE.get_files(user_id)
-  if not files:
-    return await message.reply_text(
-        "❌ Your queue is empty. Send some files first."
-    )
-
-  if USER_QUEUE.is_processing(user_id):
-    return await message.reply_text(
-        "⚠️ The bot is already processing your queue."
-    )
-
-  text = f"📊 **Queue Ready ({len(files)} files).**\n"
-  doc_type = USER_QUEUE.get_doc_type(user_id)
-
-  if not doc_type:
-    text += "\n👉 Select document structure:"
-    await message.reply_text(text, reply_markup=get_doctype_keyboard())
-  elif doc_type == "split":
-    text += "\n📑 **Structure:** `✂️ Smart Split`\n👉 Click below to run:"
-    await message.reply_text(text, reply_markup=get_split_keyboard())
-  else:
-    doc_label = (
-        "📌 Pointwise" if doc_type == "pointwise" else "📖 Chapter / Paragraph"
-    )
-    text += f"\n📑 **Structure:** `{doc_label}`\n👉 Select processing mode:"
-    await message.reply_text(text, reply_markup=get_processing_keyboard())
-
-
-async def clear_cmd(client, message: Message):
-  user_id = message.from_user.id if message.from_user else 0
-  if not is_authorized(user_id):
+  doc = message.document
+  if not doc.file_name.lower().endswith(".pdf"):
+    await message.reply_text("⚠️ Please send only valid `.pdf` documents.")
     return
 
-  USER_QUEUE.clear_queue(user_id)
+  queue = get_user_queue(message.from_user.id)
+  queue.append({
+      "file_id": doc.file_id,
+      "file_name": doc.file_name,
+      "caption": message.caption or "",
+      "file_size": doc.file_size,
+  })
+
   await message.reply_text(
-      "🗑️ **Queue cleared.** Temporary files removed from storage."
+      f"📥 **Queued:** `{doc.file_name}`\n"
+      f"Queue length: **{len(queue)}**\n"
+      "Send more files or type `/done` to proceed."
   )
 
 
-async def handle_document(client, message: Message):
-  user_id = message.from_user.id if message.from_user else 0
-  if not is_authorized(user_id):
+# ==========================================
+# ⚙️ 3. MODE SELECTION VIA /DONE
+# ==========================================
+@Client.on_message(
+    (filters.command(["done"]) | filters.regex(r"^done$")) & filters.private
+)
+async def done_handler(client: Client, message: Message):
+  queue = get_user_queue(message.from_user.id)
+  if not queue:
+    await message.reply_text(
+        "📭 Queue is empty. Send at least one PDF file first."
+    )
     return
 
-  file_name = "unknown.pdf"
-  if message.document:
-    file_name = message.document.file_name or f"doc_{uuid.uuid4().hex[:6]}.pdf"
-  elif message.photo:
-    file_name = f"photo_{uuid.uuid4().hex[:6]}.jpg"
+  keyboard = InlineKeyboardMarkup([
+      [
+          InlineKeyboardButton("✂️ Chapter Split", callback_data="mode_split"),
+          InlineKeyboardButton("📝 Generate MCQs", callback_data="mode_mcq"),
+      ],
+      [
+          InlineKeyboardButton(
+              "📖 Text Extraction", callback_data="mode_extract"
+          ),
+          InlineKeyboardButton(
+              "⚡ Both (MCQ + Text)", callback_data="mode_both"
+          ),
+      ],
+      [InlineKeyboardButton("❌ Cancel", callback_data="mode_cancel")],
+  ])
 
-  if USER_QUEUE.is_processing(user_id):
-    return await message.reply_text(
-        "⚠️ Current batch is still processing. Please wait for completion."
-    )
-
-  status_msg = await message.reply_text("📥 **Downloading to local queue...**")
-  dest_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex[:6]}_{file_name}")
-  await message.download(file_name=dest_path)
-
-  USER_QUEUE.add_file(user_id, dest_path, file_name, message.id)
-  q_len = len(USER_QUEUE.get_files(user_id))
-  GLOBAL_STATE.log(
-      f"Queued file: {file_name} for user {user_id} (Queue length: {q_len})"
+  await message.reply_text(
+      f"📋 **{len(queue)} file(s) ready for processing.**\nSelect the action"
+      " you wish to run:",
+      reply_markup=keyboard,
   )
 
-  base_text = (
-      f"📥 **Added to Queue!**\n\n📁 **File:** `{file_name}`\n📊 **Queue"
-      f" Size:** `{q_len}`\n\n"
-  )
-  doc_type = USER_QUEUE.get_doc_type(user_id)
 
-  if not doc_type:
-    await status_msg.edit_text(
-        base_text + "👉 Select document structure:",
-        reply_markup=get_doctype_keyboard(),
-    )
-  elif doc_type == "split":
-    await status_msg.edit_text(
-        base_text
-        + "📑 **Structure:** `✂️ Smart Split`\n👉 Click below to proceed:",
-        reply_markup=get_split_keyboard(),
-    )
-  else:
-    doc_label = (
-        "📌 Pointwise" if doc_type == "pointwise" else "📖 Chapter / Paragraph"
-    )
-    await status_msg.edit_text(
-        base_text
-        + f"📑 **Structure:** `{doc_label}`\n👉 Select processing mode:",
-        reply_markup=get_processing_keyboard(),
-    )
+# ==========================================
+# 🚀 4. BATCH PIPELINE DISPATCHER
+# ==========================================
+@Client.on_callback_query(filters.regex(r"^mode_"))
+async def callback_mode_dispatcher(client: Client, query: CallbackQuery):
+  mode = query.data.replace("mode_", "")
+  user_id = query.from_user.id
+  chat_id = query.message.chat.id
 
-
-async def queue_callbacks(client, callback_query: CallbackQuery):
-  user_id = callback_query.from_user.id
-  if not is_authorized(user_id):
-    return await callback_query.answer("⚠️ Unauthorized.", show_alert=True)
-
-  data = callback_query.data
-
-  if data == "clear_queue":
-    USER_QUEUE.clear_queue(user_id)
-    await callback_query.edit_message_text("🗑️ **Queue cleared successfully.**")
-    return await callback_query.answer("Queue cleared")
-
-  if not USER_QUEUE.get_files(user_id):
-    return await callback_query.answer(
-        "❌ Queue is empty or expired.", show_alert=True
-    )
-
-  if USER_QUEUE.is_processing(user_id):
-    return await callback_query.answer(
-        "⚠️ Batch currently active.", show_alert=True
-    )
-
-  if data.startswith("set_type_"):
-    dtype = data.replace("set_type_", "")
-    USER_QUEUE.set_doc_type(user_id, dtype)
-    q_len = len(USER_QUEUE.get_files(user_id))
-
-    if dtype == "split":
-      await callback_query.edit_message_text(
-          f"📊 **Queue Ready ({q_len} files)**\n📑 **Structure:** `✂️ Smart"
-          " Chapter Split`\n\n👉 Click below to execute:",
-          reply_markup=get_split_keyboard(),
-      )
-    else:
-      label = "📌 Pointwise" if dtype == "pointwise" else "📖 Chapter"
-      await callback_query.edit_message_text(
-          f"📊 **Queue Ready ({q_len} files)**\n📑 **Structure:** `{label}`\n\n👉"
-          " Select execution mode:",
-          reply_markup=get_processing_keyboard(),
-      )
+  if mode == "cancel":
+    USER_QUEUES[user_id] = []
+    await query.message.edit_text("❌ Operation canceled and queue cleared.")
     return
 
-  mode = data.replace("run_queue_", "")
-  USER_QUEUE.set_processing(user_id, True)
-  await callback_query.answer("Processing started!")
+  queue = list(get_user_queue(user_id))
+  USER_QUEUES[user_id] = []  # Clear active queue
+  await query.message.delete()
 
-  asyncio.create_task(
-      run_queue_pipeline(client, callback_query.message, user_id, mode)
+  if not queue:
+    await client.send_message(chat_id, "📭 Queue was empty.")
+    return
+
+  status_msg = await client.send_message(
+      chat_id, f"🚀 **Starting batch of {len(queue)} file(s) in `{mode}` mode...**"
   )
+
+  # Process documents sequentially
+  for idx, item in enumerate(queue, 1):
+    file_name = item["file_name"]
+    original_caption = item["caption"]
+    local_pdf_path = os.path.join(DOWNLOAD_DIR, file_name)
+
+    try:
+      # Step 1: Download the document
+      await status_msg.edit_text(
+          f"⏳ **[{idx}/{len(queue)}] Downloading:** `{file_name}`..."
+      )
+      await client.download_media(message=item["file_id"], file_name=local_pdf_path)
+
+      # Step 2: Echo back source PDF with exact filename & original caption
+      source_caption = original_caption if original_caption else f"📂 `{file_name}`"
+      await client.send_document(
+          chat_id=chat_id,
+          document=local_pdf_path,
+          file_name=file_name,
+          caption=source_caption,
+      )
+
+      # Step 3: Run the requested processing mode
+      if mode == "split":
+        await execute_chapter_split(
+            client, chat_id, local_pdf_path, file_name, status_msg
+        )
+      elif mode == "mcq":
+        await execute_mcq_generation(
+            client, chat_id, local_pdf_path, file_name, status_msg
+        )
+      elif mode == "extract":
+        await execute_text_extraction(
+            client, chat_id, local_pdf_path, file_name, status_msg
+        )
+      elif mode == "both":
+        await execute_text_extraction(
+            client, chat_id, local_pdf_path, file_name, status_msg
+        )
+        await execute_mcq_generation(
+            client, chat_id, local_pdf_path, file_name, status_msg
+        )
+
+      # Step 4: Send success sticker boundary for this completed file
+      try:
+        await client.send_sticker(chat_id=chat_id, sticker=SUCCESS_STICKER_ID)
+      except Exception as sticker_err:
+        logger.warning(f"Could not send success sticker: {sticker_err}")
+
+    except Exception as e:
+      logger.error(f"Pipeline error on file {file_name}: {e}")
+      await client.send_message(
+          chat_id, f"❌ **Error processing `{file_name}`:**\n`{e}`"
+      )
+    finally:
+      if os.path.exists(local_pdf_path):
+        os.remove(local_pdf_path)
+
+  await status_msg.delete()
+  await client.send_message(
+      chat_id, f"✅ **All {len(queue)} file(s) processed successfully!**"
+  )
+
+
+# ==========================================
+# 🛠 5. SUB-ROUTINES (SPLIT / MCQ / EXTRACT)
+# ==========================================
+async def execute_chapter_split(
+    client: Client,
+    chat_id: int,
+    pdf_path: str,
+    file_name: str,
+    status_msg: Message,
+):
+  import pymupdf
+
+  await status_msg.edit_text(f"✂️ **Splitting chapters for:** `{file_name}`...")
+  gemini_client = await init_gemini_client()
+  chat = gemini_client.start_chat(model="gemini-flash-lite")
+
+  temp_preview_dir = os.path.join(DOWNLOAD_DIR, "previews")
+  os.makedirs(temp_preview_dir, exist_ok=True)
+  preview_imgs = []
+
+  try:
+    with pymupdf.open(pdf_path) as doc:
+      max_preview = min(15, len(doc))
+      for p_idx in range(max_preview):
+        img_p = os.path.join(temp_preview_dir, f"prev_{p_idx}.png")
+        doc[p_idx].get_pixmap(dpi=150).save(img_p)
+        preview_imgs.append(img_p)
+
+    toc_data = await extract_table_of_contents(chat, preview_imgs)
+    offset = toc_data.offset
+
+    with pymupdf.open(pdf_path) as doc:
+      total_p = len(doc)
+      for i, chap in enumerate(toc_data.chapters):
+        start_p = max(0, chap.printed_page + offset)
+        if i + 1 < len(toc_data.chapters):
+          end_p = min(total_p, toc_data.chapters[i + 1].printed_page + offset)
+        else:
+          end_p = total_p
+
+        if start_p >= end_p:
+          continue
+
+        chap_pdf_name = f"Ch_{chap.number}_{chap.name[:30]}.pdf"
+        out_chap_path = os.path.join(DOWNLOAD_DIR, chap_pdf_name)
+
+        new_doc = pymupdf.open()
+        new_doc.insert_pdf(doc, from_page=start_p, to_page=end_p - 1)
+        new_doc.save(out_chap_path)
+        new_doc.close()
+
+        await client.send_document(
+            chat_id=chat_id,
+            document=out_chap_path,
+            caption=(
+                f"📖 **Chapter {chap.number}:** {chap.name}\n(Pages:"
+                f" {start_p + 1} - {end_p})"
+            ),
+        )
+        if os.path.exists(out_chap_path):
+          os.remove(out_chap_path)
+  finally:
+    shutil.rmtree(temp_preview_dir, ignore_errors=True)
+    await gemini_client.close()
+
+
+async def execute_mcq_generation(
+    client: Client,
+    chat_id: int,
+    pdf_path: str,
+    file_name: str,
+    status_msg: Message,
+):
+  import pymupdf
+
+  await status_msg.edit_text(f"📝 **Generating MCQs for:** `{file_name}`...")
+  gemini_client = await init_gemini_client()
+  chat = gemini_client.start_chat(model="gemini-flash-lite")
+
+  out_txt = os.path.join(DOWNLOAD_DIR, f"MCQ_{file_name}.txt")
+  lines = []
+
+  try:
+    with pymupdf.open(pdf_path) as doc:
+      total_pages = len(doc)
+      for p_no in range(total_pages):
+        await status_msg.edit_text(
+            f"📝 Generating MCQs ({p_no + 1}/{total_pages}) for `{file_name}`..."
+        )
+        temp_img = os.path.join(DOWNLOAD_DIR, f"temp_mcq_{p_no}.png")
+        doc[p_no].get_pixmap(dpi=200).save(temp_img)
+
+        try:
+          page_res = await generate_mcqs_for_page(chat, temp_img, p_no + 1)
+          for m in page_res.mcqs:
+            lines.append(f"{m.question} (പേജ് നമ്പർ: {p_no + 1})")
+            lines.append(f"A) {m.option_A}")
+            lines.append(f"B) {m.option_B}")
+            lines.append(f"C) {m.option_C}")
+            lines.append(f"D) {m.option_D}")
+            lines.append(f"ഉത്തരം: {m.answer_letter}) {m.answer_text}")
+            lines.append(f"Sentence : ({m.source_sentence})\n")
+        finally:
+          if os.path.exists(temp_img):
+            os.remove(temp_img)
+
+    with open(out_txt, "w", encoding="utf-8") as f:
+      f.write("\n".join(lines))
+
+    await client.send_document(
+        chat_id=chat_id,
+        document=out_txt,
+        caption=f"📝 **Generated Practice MCQs for:** `{file_name}`",
+    )
+  finally:
+    if os.path.exists(out_txt):
+      os.remove(out_txt)
+    await gemini_client.close()
+
+
+async def execute_text_extraction(
+    client: Client,
+    chat_id: int,
+    pdf_path: str,
+    file_name: str,
+    status_msg: Message,
+):
+  import pymupdf
+
+  await status_msg.edit_text(f"📖 **Extracting text from:** `{file_name}`...")
+  gemini_client = await init_gemini_client()
+
+  out_txt = os.path.join(DOWNLOAD_DIR, f"EXTRACT_{file_name}.txt")
+  all_text = []
+
+  try:
+    with pymupdf.open(pdf_path) as doc:
+      total = len(doc)
+      for p_no in range(total):
+        await status_msg.edit_text(
+            f"📖 OCR Extraction ({p_no + 1}/{total}) for `{file_name}`..."
+        )
+        temp_img = os.path.join(DOWNLOAD_DIR, f"temp_ocr_{p_no}.png")
+        doc[p_no].get_pixmap(dpi=200).save(temp_img)
+
+        try:
+          data = await extract_text_and_tables_webapi(
+              gemini_client, temp_img, p_no + 1
+          )
+          all_text.append(f"--- PAGE {p_no + 1} ---")
+          for block in data.blocks:
+            if hasattr(block, "text") and block.text:
+              all_text.append(block.text)
+          all_text.append("\n")
+        finally:
+          if os.path.exists(temp_img):
+            os.remove(temp_img)
+
+    with open(out_txt, "w", encoding="utf-8") as f:
+      f.write("\n".join(all_text))
+
+    await client.send_document(
+        chat_id=chat_id,
+        document=out_txt,
+        caption=f"📖 **Extracted Text & Tables for:** `{file_name}`",
+    )
+  finally:
+    if os.path.exists(out_txt):
+      os.remove(out_txt)
+    await gemini_client.close()
 
