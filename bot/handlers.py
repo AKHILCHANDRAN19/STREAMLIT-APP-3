@@ -12,15 +12,6 @@ from config import DOWNLOAD_DIR, OWNER_IDS
 from pyrogram.types import CallbackQuery, Message
 from utils.telemetry import GLOBAL_STATE
 
-SUCCESS_STICKER_ID = (
-    "CAACAgIAAxkBAAFDtjVpptva4k-to_n8BKzQg23QeMvSTQACVgADRA3PFxlBkhksr1N3OgQ"
-)
-
-# Global metadata registry to retain original captions and message IDs across queues
-FILE_METADATA = (
-    {}
-)  # user_id -> {dest_path: {"caption": ..., "msg_id": ..., "file_name": ...}}
-
 WELCOME_TEXT = (
     "🎯 **Welcome to the GenAI Processor Bot** 🎯\n\n"
     "Powered strictly by modern WebAPI sessions, PyMuPDF, and WeasyPrint.\n\n"
@@ -132,7 +123,6 @@ async def clear_cmd(client, message: Message):
     return
 
   USER_QUEUE.clear_queue(user_id)
-  FILE_METADATA.pop(user_id, None)
   await message.reply_text(
       "🗑️ **Queue cleared.** Temporary files removed from storage."
   )
@@ -158,16 +148,8 @@ async def handle_document(client, message: Message):
   dest_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex[:6]}_{file_name}")
   await message.download(file_name=dest_path)
 
+  # Registers the file into USER_QUEUE along with message.id for exact echoing
   USER_QUEUE.add_file(user_id, dest_path, file_name, message.id)
-
-  # Retain original caption and message ID for visual boundary echoing
-  if user_id not in FILE_METADATA:
-    FILE_METADATA[user_id] = {}
-  FILE_METADATA[user_id][dest_path] = {
-      "caption": message.caption or "",
-      "msg_id": message.id,
-      "file_name": file_name,
-  }
 
   q_len = len(USER_QUEUE.get_files(user_id))
   GLOBAL_STATE.log(
@@ -202,138 +184,6 @@ async def handle_document(client, message: Message):
     )
 
 
-async def run_segmented_pipeline(
-    client, message: Message, user_id: int, mode: str
-):
-  """Executes processing document-by-document with strict visual boundaries:
-
-  Echo Original Document -> Process Outputs -> Success Sticker
-  """
-  chat_id = message.chat.id
-  all_files = list(USER_QUEUE.get_files(user_id))
-  doc_type = USER_QUEUE.get_doc_type(user_id)
-  user_meta = FILE_METADATA.get(user_id, {})
-
-  # Dynamically detect queue dictionary container inside USER_QUEUE
-  queue_dict = None
-  for attr in [
-      "queues",
-      "_queues",
-      "files",
-      "_files",
-      "user_queues",
-      "queue_data",
-      "data",
-  ]:
-    if hasattr(USER_QUEUE, attr):
-      val = getattr(USER_QUEUE, attr)
-      if isinstance(val, dict) and user_id in val:
-        queue_dict = val
-        break
-
-  if queue_dict is not None and len(all_files) > 1:
-    # Multi-file batch: isolate each file to enforce visual boundaries per document
-    for file_item in all_files:
-      dest_path = file_item.get("path")
-      file_name = file_item.get("name")
-      meta = user_meta.get(dest_path, {})
-      msg_id = (
-          file_item.get("msg_id")
-          or file_item.get("message_id")
-          or meta.get("msg_id")
-      )
-      caption = meta.get("caption")
-
-      # 1. Echo original PDF with exact filename and attached text
-      echoed = False
-      if msg_id:
-        try:
-          await client.copy_message(
-              chat_id=chat_id, from_chat_id=chat_id, message_id=msg_id
-          )
-          echoed = True
-        except Exception:
-          pass
-
-      if not echoed and dest_path and os.path.exists(dest_path):
-        try:
-          await client.send_document(
-              chat_id=chat_id,
-              document=dest_path,
-              file_name=file_name,
-              caption=caption if caption else None,
-          )
-        except Exception as err:
-          GLOBAL_STATE.log(f"Echo document error for {file_name}: {err}")
-
-      # 2. Isolate and process this single file
-      queue_dict[user_id] = [file_item]
-      USER_QUEUE.set_doc_type(user_id, doc_type)
-      USER_QUEUE.set_processing(user_id, True)
-
-      try:
-        await run_queue_pipeline(client, message, user_id, mode)
-      except Exception as pipeline_err:
-        GLOBAL_STATE.log(f"Pipeline error on {file_name}: {pipeline_err}")
-
-      # 3. Send success sticker boundary
-      try:
-        await client.send_sticker(chat_id=chat_id, sticker=SUCCESS_STICKER_ID)
-      except Exception as sticker_err:
-        GLOBAL_STATE.log(f"Sticker boundary error: {sticker_err}")
-
-    USER_QUEUE.clear_queue(user_id)
-    USER_QUEUE.set_processing(user_id, False)
-    FILE_METADATA.pop(user_id, None)
-
-  else:
-    # Single file batch: send echo first, run pipeline, then send sticker
-    if all_files:
-      file_item = all_files[0]
-      dest_path = file_item.get("path")
-      file_name = file_item.get("name")
-      meta = user_meta.get(dest_path, {})
-      msg_id = (
-          file_item.get("msg_id")
-          or file_item.get("message_id")
-          or meta.get("msg_id")
-      )
-      caption = meta.get("caption")
-
-      echoed = False
-      if msg_id:
-        try:
-          await client.copy_message(
-              chat_id=chat_id, from_chat_id=chat_id, message_id=msg_id
-          )
-          echoed = True
-        except Exception:
-          pass
-
-      if not echoed and dest_path and os.path.exists(dest_path):
-        try:
-          await client.send_document(
-              chat_id=chat_id,
-              document=dest_path,
-              file_name=file_name,
-              caption=caption if caption else None,
-          )
-        except Exception as err:
-          GLOBAL_STATE.log(f"Echo document error: {err}")
-
-    try:
-      await run_queue_pipeline(client, message, user_id, mode)
-    except Exception as pipeline_err:
-      GLOBAL_STATE.log(f"Pipeline error: {pipeline_err}")
-
-    try:
-      await client.send_sticker(chat_id=chat_id, sticker=SUCCESS_STICKER_ID)
-    except Exception as sticker_err:
-      GLOBAL_STATE.log(f"Sticker boundary error: {sticker_err}")
-
-    FILE_METADATA.pop(user_id, None)
-
-
 async def queue_callbacks(client, callback_query: CallbackQuery):
   user_id = callback_query.from_user.id
   if not is_authorized(user_id):
@@ -343,7 +193,6 @@ async def queue_callbacks(client, callback_query: CallbackQuery):
 
   if data == "clear_queue":
     USER_QUEUE.clear_queue(user_id)
-    FILE_METADATA.pop(user_id, None)
     await callback_query.edit_message_text("🗑️ **Queue cleared successfully.**")
     return await callback_query.answer("Queue cleared")
 
@@ -377,12 +226,13 @@ async def queue_callbacks(client, callback_query: CallbackQuery):
       )
     return
 
+  # Direct execution: pipeline.py handles multi-PDF iteration, echoing, and success stickers
   mode = data.replace("run_queue_", "")
   USER_QUEUE.set_processing(user_id, True)
   await callback_query.answer("Processing started!")
 
   asyncio.create_task(
-      run_segmented_pipeline(client, callback_query.message, user_id, mode)
+      run_queue_pipeline(client, callback_query.message, user_id, mode)
   )
 
 
