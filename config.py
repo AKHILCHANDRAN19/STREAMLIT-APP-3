@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import streamlit as st
 
 
@@ -32,52 +31,44 @@ FONT_PATH = os.path.abspath("THUMBA-Bold.ttf")
 
 MAX_PAGES_PER_RUN = 250
 EXTRA_MCQS = 4
-
-# UPDATED: Increased delay to 12 seconds to prevent quota bans
 DELAY_BETWEEN_PAGES = 12
 
 
-def get_gemini_credentials() -> tuple[str, str, dict[str, str]]:
-  """Extracts PSID, optional PSIDTS, and full cookies by randomly rotating accounts."""
-  accounts = []
-
-  # 1. Gather all accounts matching GEMINI_COOKIES_
+def get_all_gemini_accounts() -> list[tuple[str, str]]:
+  """Parses all configured GEMINI_COOKIES into a list of (psid, psidts)."""
+  accounts_raw = []
   try:
-    for key in st.secrets:
+    for key in sorted(st.secrets.keys()):
       if key.startswith("GEMINI_COOKIES_") and st.secrets[key]:
-        accounts.append(str(st.secrets[key]).strip())
+        accounts_raw.append(str(st.secrets[key]).strip())
   except Exception:
     pass
 
-  # Fallback to the old single JSON key if the numbered ones are missing
-  if not accounts:
-    legacy_cookie = get_secret("GEMINI_COOKIES_JSON")
-    if legacy_cookie:
-      accounts.append(legacy_cookie)
+  if not accounts_raw:
+    legacy = get_secret("GEMINI_COOKIES_JSON")
+    if legacy:
+      accounts_raw.append(legacy)
 
-  if not accounts:
-    raise ValueError("Missing 'GEMINI_COOKIES_...' in Streamlit secrets.")
+  parsed_accounts = []
+  for raw_json in accounts_raw:
+    try:
+      data = json.loads(raw_json)
+      cookie_dict = {}
+      if isinstance(data, list):
+        for c in data:
+          if "name" in c and "value" in c:
+            cookie_dict[c["name"]] = str(c["value"])
+      elif isinstance(data, dict):
+        cookie_dict = {k: str(v) for k, v in data.items()}
 
-  # 2. Randomly select one Google account for this run
-  selected_raw_cookies = random.choice(accounts)
+      psid = cookie_dict.get("__Secure-1PSID", "")
+      psidts = cookie_dict.get("__Secure-1PSIDTS", "")
+      if psid:
+        parsed_accounts.append((psid, psidts))
+    except Exception:
+      continue
 
-  try:
-    data = json.loads(selected_raw_cookies)
-  except json.JSONDecodeError as e:
-    raise ValueError(f"Selected 'GEMINI_COOKIES' contains invalid JSON: {e}")
+  if not parsed_accounts:
+    raise ValueError("No valid GEMINI_COOKIES found in Streamlit secrets.")
 
-  cookie_dict = {}
-  if isinstance(data, list):
-    for c in data:
-      if "name" in c and "value" in c:
-        cookie_dict[c["name"]] = str(c["value"])
-  elif isinstance(data, dict):
-    cookie_dict = {k: str(v) for k, v in data.items()}
-
-  psid = cookie_dict.get("__Secure-1PSID", "")
-  psidts = cookie_dict.get("__Secure-1PSIDTS", "")
-
-  if not psid:
-    raise ValueError("Missing required '__Secure-1PSID' in selected cookies.")
-
-  return psid, psidts, cookie_dict
+  return parsed_accounts
