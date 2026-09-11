@@ -62,7 +62,12 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         preview_images = render_preview_pages(
             file_path, DOWNLOAD_DIR, max_pages=15
         )
-        split_chat = gem_client.start_chat()
+
+        # Force gemini-flash-lite
+        split_chat = gem_client.start_chat(model="gemini-flash-lite")
+        print(
+            f"[GEMINI API] Split chat locked to: {split_chat.model}", flush=True
+        )
 
         try:
           analysis = await extract_table_of_contents(split_chat, preview_images)
@@ -152,7 +157,13 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       # Render Page 1 to determine title
       p1_img = os.path.join(DOWNLOAD_DIR, f"p1_{uuid.uuid4().hex[:6]}.png")
       render_page_image(file_path, 0, p1_img, dpi=150)
-      active_chat = gem_client.start_chat()
+
+      # Force gemini-flash-lite
+      active_chat = gem_client.start_chat(model="gemini-flash-lite")
+      print(
+          f"[GEMINI API] Active chat locked to: {active_chat.model}", flush=True
+      )
+
       doc_title = await analyze_document_title(active_chat, p1_img)
       if os.path.exists(p1_img):
         os.remove(p1_img)
