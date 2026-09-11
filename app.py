@@ -1,15 +1,14 @@
-import sys
-
-# 1. Force instant, unbuffered log flushing in Streamlit Cloud
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
 import asyncio
 import logging
+import sys
 import threading
 from bot.client import build_telegram_client
 import streamlit as st
 from utils.telemetry import GLOBAL_STATE
+
+# 1. Force instant, unbuffered log flushing in Streamlit Cloud
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 
 # 2. Bridge all logger.info/warning calls into GLOBAL_STATE for web display
@@ -23,11 +22,14 @@ class TelemetryLogHandler(logging.Handler):
       pass
 
 
+# Configure root logger and guard against duplicate handler stacking on rerun
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-bridge_handler = TelemetryLogHandler()
-bridge_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-root_logger.addHandler(bridge_handler)
+
+if not any(isinstance(h, TelemetryLogHandler) for h in root_logger.handlers):
+  bridge_handler = TelemetryLogHandler()
+  bridge_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+  root_logger.addHandler(bridge_handler)
 
 
 # ==========================================
@@ -95,7 +97,6 @@ with col2:
 
   @st.fragment(run_every="3s")
   def render_telemetry_console():
-    # Convert deque to a list before slicing to avoid TypeError
     history = list(GLOBAL_STATE.log_history) if GLOBAL_STATE.log_history else []
     log_text = (
         "\n".join(history[-40:])
@@ -105,3 +106,4 @@ with col2:
     st.code(log_text, language="text")
 
   render_telemetry_console()
+
