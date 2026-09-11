@@ -163,7 +163,7 @@ async def extract_text_and_tables_webapi(
     """
   try:
     resp = await client.generate_content(
-        prompt, model="gemini-3-flash", files=[img_path]
+        prompt, model="gemini-flash-lite", files=[img_path]
     )
     decoded = robust_json_decode(resp.text, page_num)
     return WebAPIPageExtraction.model_validate(decoded)
