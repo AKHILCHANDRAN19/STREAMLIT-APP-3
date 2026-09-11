@@ -1,8 +1,34 @@
+import sys
+
+# 1. Force instant, unbuffered log flushing in Streamlit Cloud
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import asyncio
+import logging
 import threading
 from bot.client import build_telegram_client
 import streamlit as st
 from utils.telemetry import GLOBAL_STATE
+
+
+# 2. Bridge all logger.info/warning calls into GLOBAL_STATE for web display
+class TelemetryLogHandler(logging.Handler):
+
+  def emit(self, record):
+    try:
+      msg = self.format(record)
+      GLOBAL_STATE.log(msg)
+    except Exception:
+      pass
+
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+bridge_handler = TelemetryLogHandler()
+bridge_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+root_logger.addHandler(bridge_handler)
+
 
 # ==========================================
 # 🚀 1. ASYNC BOT RUNNER (SIGNAL BYPASS)
@@ -61,16 +87,20 @@ with col1:
   st.metric(label="Current Task", value=GLOBAL_STATE.current_status["task"])
   st.info(GLOBAL_STATE.current_status["details"])
 
-  if st.button("🔄 Refresh Dashboard"):
+  if st.button("🔄 Force Refresh"):
     st.rerun()
 
 with col2:
   st.subheader("📜 Live Telemetry Console")
-  log_area = st.empty()
-  log_text = (
-      "\n".join(GLOBAL_STATE.log_history)
-      if GLOBAL_STATE.log_history
-      else "System ready. Awaiting requests..."
-  )
-  log_area.code(log_text, language="text")
 
+  # 3. Auto-refreshing log box (updates every 3 seconds automatically)
+  @st.fragment(run_every="3s")
+  def render_telemetry_console():
+    log_text = (
+        "\n".join(GLOBAL_STATE.log_history[-40:])
+        if GLOBAL_STATE.log_history
+        else "System ready. Awaiting requests..."
+    )
+    st.code(log_text, language="text")
+
+  render_telemetry_console()
