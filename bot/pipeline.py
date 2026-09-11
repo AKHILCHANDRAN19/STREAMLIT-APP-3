@@ -36,6 +36,8 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
   doc_type = USER_QUEUE.get_doc_type(user_id) or "pointwise"
 
   gem_client = None
+  channel_active = bool(TARGET_CHANNEL_ID)
+
   try:
     await status_msg.edit_text("🏁 **Connecting Gemini WebAPI session...**")
     gem_client = await init_gemini_client()
@@ -49,7 +51,7 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       file_path = f_info["path"]
       original_name = f_info["name"]
 
-      # ─── 1. INSTANT SERVER-SIDE CLONE (0 KB UPLOAD / NO TIMEOUTS) ───
+      # ─── 1. INSTANT SERVER-SIDE CLONE (0 KB UPLOAD) ───
       orig_msg_id = (
           f_info.get("msg_id")
           or f_info.get("message_id")
@@ -152,20 +154,25 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
 
         for s_file in split_files:
           sent_doc = await client.send_document(user_id, s_file)
-          if TARGET_CHANNEL_ID and sent_doc and sent_doc.document:
+
+          # Forward via server-side file_id without spamming invalid channels
+          if channel_active and sent_doc and sent_doc.document:
             try:
-              # Forwards via Telegram file_id (0 KB container upload bandwidth)
               await client.send_document(
                   TARGET_CHANNEL_ID, sent_doc.document.file_id
               )
             except Exception as chan_err:
-              logger.warning(f"Channel forwarding skipped: {chan_err}")
+              channel_active = False
+              logger.warning(f"Channel forwarding permanently disabled: {chan_err}")
+
           if os.path.exists(s_file):
             os.remove(s_file)
 
+          # TCP media socket cooldown to prevent dropped pipes
+          await asyncio.sleep(1.5)
+
         await item_status.delete()
 
-        # ─── 3. SEND SUCCESS STICKER (SPLIT MODE) ───
         try:
           await client.send_sticker(user_id, SUCCESS_STICKER_ID)
         except Exception as e:
@@ -190,7 +197,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       total_pages = min(total_pages, MAX_PAGES_PER_RUN)
       doc_title = f"Document_{uuid.uuid4().hex[:6]}"
 
-      # Render Page 1 to determine title
       p1_img = os.path.join(DOWNLOAD_DIR, f"p1_{uuid.uuid4().hex[:6]}.png")
       render_page_image(file_path, 0, p1_img, dpi=150)
 
@@ -223,7 +229,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         render_page_image(file_path, page_num - 1, curr_img, dpi=300)
 
         try:
-          # Mode: Text & Tables Extraction
           if mode in ["text_gem", "both_gem"]:
             page_blocks = await extract_text_and_tables_webapi(
                 gem_client, curr_img, page_num
@@ -246,7 +251,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
                       f.write(f"• {h_label}: {cell}\n")
                     f.write("------------------\n")
 
-          # Mode: MCQ Generation
           if mode in ["mcq_gem", "both_gem"]:
             mcq_res = await generate_mcqs_for_page(
                 active_chat, curr_img, page_num, doc_type=doc_type
@@ -267,7 +271,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
           f"🎬 **[{idx}/{total_files}] Compiling deliverables...**"
       )
 
-      # Deliver Text & Tables File
       if (
           mode in ["text_gem", "both_gem"]
           and os.path.exists(gem_text_path)
@@ -280,15 +283,15 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         sent_gem = await client.send_document(
             user_id, gem_text_path, caption=caption
         )
-        if TARGET_CHANNEL_ID and sent_gem and sent_gem.document:
+        if channel_active and sent_gem and sent_gem.document:
           try:
             await client.send_document(
                 TARGET_CHANNEL_ID, sent_gem.document.file_id, caption=caption
             )
           except Exception:
-            pass
+            channel_active = False
+        await asyncio.sleep(1.5)
 
-      # Deliver MCQ Output Files
       if mode in ["mcq_gem", "both_gem"] and all_mcqs:
         compile_pdf_with_weasyprint(
             all_mcqs, doc_title, out_pdf_path, out_html_path
@@ -302,13 +305,14 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
           sent_txt = await client.send_document(
               user_id, out_txt_path, caption=caption
           )
-          if TARGET_CHANNEL_ID and sent_txt and sent_txt.document:
+          if channel_active and sent_txt and sent_txt.document:
             try:
               await client.send_document(
                   TARGET_CHANNEL_ID, sent_txt.document.file_id, caption=caption
               )
             except Exception:
-              pass
+              channel_active = False
+          await asyncio.sleep(1.5)
 
         if os.path.exists(out_pdf_path):
           sent_pdf = await client.send_document(
@@ -316,7 +320,7 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
               out_pdf_path,
               caption="🎨 **Formatted Custom Font PDF (+10pt).**",
           )
-          if TARGET_CHANNEL_ID and sent_pdf and sent_pdf.document:
+          if channel_active and sent_pdf and sent_pdf.document:
             try:
               await client.send_document(
                   TARGET_CHANNEL_ID,
@@ -324,15 +328,16 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
                   caption=f"🎨 Formatted PDF for User {user_id}",
               )
             except Exception:
-              pass
+              channel_active = False
+          await asyncio.sleep(1.5)
         elif os.path.exists(out_html_path):
           await client.send_document(
               user_id,
               out_html_path,
               caption="🌐 **HTML Fallback (PDF compile skipped).**",
           )
+          await asyncio.sleep(1.5)
 
-      # Cleanup temporary generated files
       for tmp in [
           file_path,
           out_txt_path,
@@ -348,7 +353,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
 
       await item_status.delete()
 
-      # ─── 3. SEND SUCCESS STICKER (MCQ, TEXT & BOTH MODES) ───
       try:
         await client.send_sticker(user_id, SUCCESS_STICKER_ID)
       except Exception as e:
