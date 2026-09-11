@@ -20,13 +20,6 @@ from services.gemini_service import (
 )
 from utils.telemetry import GLOBAL_STATE
 
-try:
-  from weasyprint import HTML
-
-  WEASYPRINT_AVAILABLE = True
-except ImportError:
-  WEASYPRINT_AVAILABLE = False
-
 logger = logging.getLogger("Bot_Handlers")
 
 SUCCESS_STICKER_ID = (
@@ -44,9 +37,36 @@ def get_user_queue(user_id: int) -> list:
 
 
 # ==========================================
+# 📡 0. TELEMETRY MESSAGE LOGGER (REQUIRED BY client.py)
+# ==========================================
+async def log_incoming_messages(client: Client, message: Message):
+  """Intercepts and logs every incoming update to terminal and GLOBAL_STATE."""
+  if not message or not message.from_user:
+    return
+
+  user_id = message.from_user.id
+  if message.text:
+    desc = message.text
+  elif message.document:
+    desc = f"[Media/File] {message.document.file_name or ''}".strip()
+  elif message.photo:
+    desc = "[Photo]"
+  else:
+    desc = "[Media/File]"
+
+  log_entry = f"📩 Incoming: {desc} from User {user_id}"
+  GLOBAL_STATE.log(log_entry)
+  print(f"[{log_entry}]", flush=True)
+
+  try:
+    message.continue_propagation()
+  except Exception:
+    pass
+
+
+# ==========================================
 # 📥 1. COMMAND HANDLERS (EXACT NAMES FOR client.py)
 # ==========================================
-@Client.on_message(filters.command(["start", "help"]) & filters.private)
 async def start_cmd(client: Client, message: Message):
   USER_QUEUES[message.from_user.id] = []
   welcome_text = (
@@ -60,7 +80,6 @@ async def start_cmd(client: Client, message: Message):
   await message.reply_text(welcome_text)
 
 
-@Client.on_message(filters.command(["queue"]) & filters.private)
 async def check_queue_cmd(client: Client, message: Message):
   queue = get_user_queue(message.from_user.id)
   if not queue:
@@ -73,15 +92,11 @@ async def check_queue_cmd(client: Client, message: Message):
   await message.reply_text("\n".join(lines))
 
 
-@Client.on_message(filters.command(["clear"]) & filters.private)
 async def clear_cmd(client: Client, message: Message):
   USER_QUEUES[message.from_user.id] = []
   await message.reply_text("🗑 **Queue cleared successfully.**")
 
 
-@Client.on_message(
-    (filters.command(["done"]) | filters.regex(r"^done$")) & filters.private
-)
 async def done_cmd(client: Client, message: Message):
   queue = get_user_queue(message.from_user.id)
   if not queue:
@@ -116,14 +131,13 @@ async def done_cmd(client: Client, message: Message):
 # ==========================================
 # 📄 2. DOCUMENT INGESTION
 # ==========================================
-@Client.on_message(filters.document & filters.private)
 async def pdf_handler(client: Client, message: Message):
   if OWNER_IDS and message.from_user.id not in OWNER_IDS:
     await message.reply_text("⛔ You are not authorized to use this bot.")
     return
 
   doc = message.document
-  if not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
+  if not doc or not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
     await message.reply_text("⚠️ Please send only valid `.pdf` documents.")
     return
 
@@ -148,7 +162,6 @@ async def pdf_handler(client: Client, message: Message):
 # ==========================================
 # 🚀 3. CALLBACK QUERY DISPATCHER
 # ==========================================
-@Client.on_callback_query(filters.regex(r"^mode_"))
 async def callback_handler(client: Client, query: CallbackQuery):
   mode = query.data.replace("mode_", "")
   user_id = query.from_user.id
@@ -186,7 +199,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
           message=item["file_id"], file_name=local_pdf_path
       )
 
-      # Step 2: ECHO ORIGINAL PDF BACK FIRST WITH EXACT NAME & ORIGINAL CAPTION
+      # Step 2: Send back source PDF with exact filename and original caption
       await client.send_document(
           chat_id=chat_id,
           document=local_pdf_path,
@@ -215,7 +228,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
             client, chat_id, local_pdf_path, file_name, status_msg
         )
 
-      # Step 4: Send success sticker boundary for this specific document
+      # Step 4: Send success sticker boundary for this completed file
       try:
         await client.send_sticker(chat_id=chat_id, sticker=SUCCESS_STICKER_ID)
       except Exception as sticker_err:
@@ -421,8 +434,11 @@ async def execute_text_extraction(
     await gemini_client.close()
 
 
-# Compatibility aliases for alternative imports in bot/client.py
+# Compatibility aliases
 start_handler = start_cmd
+queue_cmd = check_queue_cmd
+clear_handler = clear_cmd
+done_handler = done_cmd
 document_handler = pdf_handler
 handle_document = pdf_handler
 document_receiver = pdf_handler
