@@ -49,32 +49,19 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       file_path = f_info["path"]
       original_name = f_info["name"]
 
-      # ─── 1. ECHO SOURCE PDF BACK FIRST (EXACT NAME & ATTACHED TEXT) ───
+      # ─── 1. INSTANT SERVER-SIDE CLONE (0 KB UPLOAD / NO TIMEOUTS) ───
       orig_msg_id = (
           f_info.get("msg_id")
           or f_info.get("message_id")
           or f_info.get("id")
       )
-      echoed = False
       if orig_msg_id:
         try:
           await client.copy_message(
               chat_id=user_id, from_chat_id=user_id, message_id=orig_msg_id
           )
-          echoed = True
         except Exception as e:
-          logger.warning(f"Could not copy source message: {e}")
-
-      if not echoed and os.path.exists(file_path):
-        try:
-          await client.send_document(
-              chat_id=user_id,
-              document=file_path,
-              file_name=original_name,
-              caption=f_info.get("caption") or None,
-          )
-        except Exception as e:
-          logger.warning(f"Could not send source document: {e}")
+          logger.warning(f"Could not clone source message: {e}")
 
       item_status = await client.send_message(
           user_id,
@@ -110,7 +97,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
           await item_status.edit_text(
               f"❌ Could not find Table of Contents in `{original_name}`."
           )
-          # Send sticker even if skipped so user knows document is finalized
           try:
             await client.send_sticker(user_id, SUCCESS_STICKER_ID)
           except Exception:
@@ -165,11 +151,15 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         )
 
         for s_file in split_files:
-          await client.send_document(user_id, s_file)
-          try:
-            await client.send_document(TARGET_CHANNEL_ID, s_file)
-          except Exception:
-            pass
+          sent_doc = await client.send_document(user_id, s_file)
+          if TARGET_CHANNEL_ID and sent_doc and sent_doc.document:
+            try:
+              # Forwards via Telegram file_id (0 KB container upload bandwidth)
+              await client.send_document(
+                  TARGET_CHANNEL_ID, sent_doc.document.file_id
+              )
+            except Exception as chan_err:
+              logger.warning(f"Channel forwarding skipped: {chan_err}")
           if os.path.exists(s_file):
             os.remove(s_file)
 
@@ -287,13 +277,16 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
             f"🌐 **Extracted Text & Tables**\n📁 File: `{original_name}`\n👤"
             f" User: `{user_id}`"
         )
-        await client.send_document(user_id, gem_text_path, caption=caption)
-        try:
-          await client.send_document(
-              TARGET_CHANNEL_ID, gem_text_path, caption=caption
-          )
-        except Exception:
-          pass
+        sent_gem = await client.send_document(
+            user_id, gem_text_path, caption=caption
+        )
+        if TARGET_CHANNEL_ID and sent_gem and sent_gem.document:
+          try:
+            await client.send_document(
+                TARGET_CHANNEL_ID, sent_gem.document.file_id, caption=caption
+            )
+          except Exception:
+            pass
 
       # Deliver MCQ Output Files
       if mode in ["mcq_gem", "both_gem"] and all_mcqs:
@@ -306,28 +299,32 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         )
 
         if os.path.exists(out_txt_path):
-          await client.send_document(user_id, out_txt_path, caption=caption)
-          try:
-            await client.send_document(
-                TARGET_CHANNEL_ID, out_txt_path, caption=caption
-            )
-          except Exception:
-            pass
+          sent_txt = await client.send_document(
+              user_id, out_txt_path, caption=caption
+          )
+          if TARGET_CHANNEL_ID and sent_txt and sent_txt.document:
+            try:
+              await client.send_document(
+                  TARGET_CHANNEL_ID, sent_txt.document.file_id, caption=caption
+              )
+            except Exception:
+              pass
 
         if os.path.exists(out_pdf_path):
-          await client.send_document(
+          sent_pdf = await client.send_document(
               user_id,
               out_pdf_path,
               caption="🎨 **Formatted Custom Font PDF (+10pt).**",
           )
-          try:
-            await client.send_document(
-                TARGET_CHANNEL_ID,
-                out_pdf_path,
-                caption=f"🎨 Formatted PDF for User {user_id}",
-            )
-          except Exception:
-            pass
+          if TARGET_CHANNEL_ID and sent_pdf and sent_pdf.document:
+            try:
+              await client.send_document(
+                  TARGET_CHANNEL_ID,
+                  sent_pdf.document.file_id,
+                  caption=f"🎨 Formatted PDF for User {user_id}",
+              )
+            except Exception:
+              pass
         elif os.path.exists(out_html_path):
           await client.send_document(
               user_id,
