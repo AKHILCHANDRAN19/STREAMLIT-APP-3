@@ -1,6 +1,6 @@
 import json
 import os
-import pathlib
+import random
 import streamlit as st
 
 
@@ -32,19 +32,39 @@ FONT_PATH = os.path.abspath("THUMBA-Bold.ttf")
 
 MAX_PAGES_PER_RUN = 250
 EXTRA_MCQS = 4
-DELAY_BETWEEN_PAGES = 3
+
+# UPDATED: Increased delay to 12 seconds to prevent quota bans
+DELAY_BETWEEN_PAGES = 12
 
 
 def get_gemini_credentials() -> tuple[str, str, dict[str, str]]:
-  """Extracts PSID, optional PSIDTS, and the full cookie dictionary."""
-  raw_cookies = get_secret("GEMINI_COOKIES_JSON")
-  if not raw_cookies:
-    raise ValueError("Missing 'GEMINI_COOKIES_JSON' in Streamlit secrets.")
+  """Extracts PSID, optional PSIDTS, and full cookies by randomly rotating accounts."""
+  accounts = []
+
+  # 1. Gather all accounts matching GEMINI_COOKIES_
+  try:
+    for key in st.secrets:
+      if key.startswith("GEMINI_COOKIES_") and st.secrets[key]:
+        accounts.append(str(st.secrets[key]).strip())
+  except Exception:
+    pass
+
+  # Fallback to the old single JSON key if the numbered ones are missing
+  if not accounts:
+    legacy_cookie = get_secret("GEMINI_COOKIES_JSON")
+    if legacy_cookie:
+      accounts.append(legacy_cookie)
+
+  if not accounts:
+    raise ValueError("Missing 'GEMINI_COOKIES_...' in Streamlit secrets.")
+
+  # 2. Randomly select one Google account for this run
+  selected_raw_cookies = random.choice(accounts)
 
   try:
-    data = json.loads(raw_cookies)
+    data = json.loads(selected_raw_cookies)
   except json.JSONDecodeError as e:
-    raise ValueError(f"'GEMINI_COOKIES_JSON' contains invalid JSON: {e}")
+    raise ValueError(f"Selected 'GEMINI_COOKIES' contains invalid JSON: {e}")
 
   cookie_dict = {}
   if isinstance(data, list):
@@ -58,6 +78,6 @@ def get_gemini_credentials() -> tuple[str, str, dict[str, str]]:
   psidts = cookie_dict.get("__Secure-1PSIDTS", "")
 
   if not psid:
-    raise ValueError("Missing required '__Secure-1PSID' in cookies.")
+    raise ValueError("Missing required '__Secure-1PSID' in selected cookies.")
 
   return psid, psidts, cookie_dict
