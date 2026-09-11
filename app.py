@@ -93,12 +93,13 @@ with col1:
 with col2:
   st.subheader("📜 Live Telemetry Console")
 
-  # 3. Auto-refreshing log box (updates every 3 seconds automatically)
   @st.fragment(run_every="3s")
   def render_telemetry_console():
+    # Convert deque to a list before slicing to avoid TypeError
+    history = list(GLOBAL_STATE.log_history) if GLOBAL_STATE.log_history else []
     log_text = (
-        "\n".join(GLOBAL_STATE.log_history[-40:])
-        if GLOBAL_STATE.log_history
+        "\n".join(history[-40:])
+        if history
         else "System ready. Awaiting requests..."
     )
     st.code(log_text, language="text")
