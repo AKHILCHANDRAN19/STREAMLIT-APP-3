@@ -36,9 +36,9 @@ def get_user_queue(user_id: int) -> list:
   return USER_QUEUES[user_id]
 
 
-# ==========================================
-# 📡 0. TELEMETRY MESSAGE LOGGER (REQUIRED BY client.py)
-# ==========================================
+# ==============================================================================
+# 📡 1. TELEMETRY & COMMAND HANDLERS (EXACT NAMES FOR client.py)
+# ==============================================================================
 async def log_incoming_messages(client: Client, message: Message):
   """Intercepts and logs every incoming update to terminal and GLOBAL_STATE."""
   if not message or not message.from_user:
@@ -64,9 +64,6 @@ async def log_incoming_messages(client: Client, message: Message):
     pass
 
 
-# ==========================================
-# 📥 1. COMMAND HANDLERS (EXACT NAMES FOR client.py)
-# ==========================================
 async def start_cmd(client: Client, message: Message):
   USER_QUEUES[message.from_user.id] = []
   welcome_text = (
@@ -107,18 +104,22 @@ async def done_cmd(client: Client, message: Message):
 
   keyboard = InlineKeyboardMarkup([
       [
-          InlineKeyboardButton("✂️ Chapter Split", callback_data="mode_split"),
-          InlineKeyboardButton("📝 Generate MCQs", callback_data="mode_mcq"),
+          InlineKeyboardButton(
+              "✂️ Chapter Split", callback_data="run_queue_split"
+          ),
+          InlineKeyboardButton(
+              "📝 Generate MCQs", callback_data="run_queue_mcq_gem"
+          ),
       ],
       [
           InlineKeyboardButton(
-              "📖 Text Extraction", callback_data="mode_extract"
+              "📖 Text Extraction", callback_data="run_queue_text_gem"
           ),
           InlineKeyboardButton(
-              "⚡ Both (MCQ + Text)", callback_data="mode_both"
+              "⚡ Both (MCQ + Text)", callback_data="run_queue_both_gem"
           ),
       ],
-      [InlineKeyboardButton("❌ Cancel", callback_data="mode_cancel")],
+      [InlineKeyboardButton("🗑 Clear Queue", callback_data="clear_queue")],
   ])
 
   await message.reply_text(
@@ -128,10 +129,10 @@ async def done_cmd(client: Client, message: Message):
   )
 
 
-# ==========================================
-# 📄 2. DOCUMENT INGESTION
-# ==========================================
-async def pdf_handler(client: Client, message: Message):
+# ==============================================================================
+# 📄 2. DOCUMENT INGESTION (EXACT NAME FOR client.py)
+# ==============================================================================
+async def handle_document(client: Client, message: Message):
   if OWNER_IDS and message.from_user.id not in OWNER_IDS:
     await message.reply_text("⛔ You are not authorized to use this bot.")
     return
@@ -159,19 +160,27 @@ async def pdf_handler(client: Client, message: Message):
   )
 
 
-# ==========================================
-# 🚀 3. CALLBACK QUERY DISPATCHER
-# ==========================================
-async def callback_handler(client: Client, query: CallbackQuery):
-  mode = query.data.replace("mode_", "")
+# ==============================================================================
+# 🚀 3. CALLBACK QUERY PROCESSOR (EXACT NAME FOR client.py)
+# ==============================================================================
+async def queue_callbacks(client: Client, query: CallbackQuery):
+  data = query.data
   user_id = query.from_user.id
   chat_id = query.message.chat.id
 
-  if mode == "cancel":
+  if data == "clear_queue":
     USER_QUEUES[user_id] = []
-    await query.message.edit_text("❌ Operation canceled and queue cleared.")
+    await query.message.edit_text("🗑 **Queue cleared successfully.**")
     return
 
+  mode_map = {
+      "run_queue_split": "split",
+      "run_queue_mcq_gem": "mcq",
+      "run_queue_text_gem": "extract",
+      "run_queue_both_gem": "both",
+  }
+
+  mode = mode_map.get(data, "split")
   queue = list(get_user_queue(user_id))
   USER_QUEUES[user_id] = []
   await query.message.delete()
@@ -191,7 +200,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
     local_pdf_path = os.path.join(DOWNLOAD_DIR, file_name)
 
     try:
-      # Step 1: Download the source PDF
+      # Step 1: Download the file locally
       await status_msg.edit_text(
           f"⏳ **[{idx}/{len(queue)}] Downloading:** `{file_name}`..."
       )
@@ -199,7 +208,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
           message=item["file_id"], file_name=local_pdf_path
       )
 
-      # Step 2: Send back source PDF with exact filename and original caption
+      # Step 2: ECHO ORIGINAL PDF BACK FIRST WITH EXACT NAME & CAPTION
       await client.send_document(
           chat_id=chat_id,
           document=local_pdf_path,
@@ -207,7 +216,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
           caption=original_caption if original_caption else None,
       )
 
-      # Step 3: Run processing mode
+      # Step 3: Run the requested pipeline mode
       if mode == "split":
         await execute_chapter_split(
             client, chat_id, local_pdf_path, file_name, status_msg
@@ -228,7 +237,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
             client, chat_id, local_pdf_path, file_name, status_msg
         )
 
-      # Step 4: Send success sticker boundary for this completed file
+      # Step 4: Send success sticker boundary for this specific document
       try:
         await client.send_sticker(chat_id=chat_id, sticker=SUCCESS_STICKER_ID)
       except Exception as sticker_err:
@@ -249,9 +258,9 @@ async def callback_handler(client: Client, query: CallbackQuery):
   )
 
 
-# ==========================================
+# ==============================================================================
 # ✂️ SUBROUTINE: CHAPTER SPLIT
-# ==========================================
+# ==============================================================================
 async def execute_chapter_split(
     client: Client,
     chat_id: int,
@@ -265,7 +274,9 @@ async def execute_chapter_split(
   gemini_client = await init_gemini_client()
   chat = gemini_client.start_chat(model="gemini-flash-lite")
 
-  temp_preview_dir = os.path.join(DOWNLOAD_DIR, "previews")
+  temp_preview_dir = os.path.join(
+      DOWNLOAD_DIR, f"prev_{os.getpid()}_{abs(chat_id)}"
+  )
   os.makedirs(temp_preview_dir, exist_ok=True)
   preview_imgs = []
 
@@ -285,19 +296,42 @@ async def execute_chapter_split(
         " starts...**"
     )
 
+    verified_chapters = []
+    with pymupdf.open(pdf_path) as doc:
+      for chap in toc_data.chapters:
+        target_idx = chap.printed_page + offset
+        if 0 <= target_idx < len(doc):
+          verify_img = os.path.join(
+              temp_preview_dir, f"verify_ch_{chap.number}.png"
+          )
+          doc[target_idx].get_pixmap(dpi=150).save(verify_img)
+          await verify_chapter_page(chat, verify_img, chap.number, chap.name)
+          verified_chapters.append(chap)
+          if os.path.exists(verify_img):
+            os.remove(verify_img)
+        else:
+          verified_chapters.append(chap)
+
     with pymupdf.open(pdf_path) as doc:
       total_p = len(doc)
-      for i, chap in enumerate(toc_data.chapters):
+      for i, chap in enumerate(verified_chapters):
         start_p = max(0, chap.printed_page + offset)
-        if i + 1 < len(toc_data.chapters):
-          end_p = min(total_p, toc_data.chapters[i + 1].printed_page + offset)
+        if i + 1 < len(verified_chapters):
+          end_p = min(total_p, verified_chapters[i + 1].printed_page + offset)
         else:
           end_p = total_p
 
         if start_p >= end_p:
           continue
 
-        chap_pdf_name = f"Ch_{chap.number}_{chap.name[:30]}.pdf"
+        clean_ch_name = "".join(
+            c for c in chap.name if c.isalnum() or c in (" ", "_", "-")
+        ).strip()[:40]
+        chap_pdf_name = (
+            f"Ch_{chap.number}_{clean_ch_name}.pdf"
+            if clean_ch_name
+            else f"Chapter_{chap.number}.pdf"
+        )
         out_chap_path = os.path.join(DOWNLOAD_DIR, chap_pdf_name)
 
         new_doc = pymupdf.open()
@@ -308,6 +342,7 @@ async def execute_chapter_split(
         await client.send_document(
             chat_id=chat_id,
             document=out_chap_path,
+            file_name=chap_pdf_name,
             caption=(
                 f"📖 **Chapter {chap.number}:** {chap.name}\n(Pages:"
                 f" {start_p + 1} - {end_p})"
@@ -320,9 +355,9 @@ async def execute_chapter_split(
     await gemini_client.close()
 
 
-# ==========================================
+# ==============================================================================
 # 📝 SUBROUTINE: MCQ GENERATION
-# ==========================================
+# ==============================================================================
 async def execute_mcq_generation(
     client: Client,
     chat_id: int,
@@ -336,7 +371,8 @@ async def execute_mcq_generation(
   gemini_client = await init_gemini_client()
   chat = gemini_client.start_chat(model="gemini-flash-lite")
 
-  out_txt = os.path.join(DOWNLOAD_DIR, f"MCQ_{file_name}.txt")
+  base_name = os.path.splitext(file_name)[0]
+  out_txt = os.path.join(DOWNLOAD_DIR, f"MCQ_{base_name}.txt")
   lines = []
   curr_counter = 1
 
@@ -347,13 +383,17 @@ async def execute_mcq_generation(
         await status_msg.edit_text(
             f"📝 Generating MCQs ({p_no + 1}/{total_pages}) for `{file_name}`..."
         )
-        temp_img = os.path.join(DOWNLOAD_DIR, f"temp_mcq_{p_no}.png")
+        temp_img = os.path.join(
+            DOWNLOAD_DIR, f"temp_mcq_{os.getpid()}_{p_no}.png"
+        )
         doc[p_no].get_pixmap(dpi=200).save(temp_img)
 
         try:
           page_res = await generate_mcqs_for_page(chat, temp_img, p_no + 1)
           for m in page_res.mcqs:
-            lines.append(f"{curr_counter}. {m.question} (പേജ് നമ്പർ: {p_no + 1})")
+            lines.append(
+                f"{curr_counter}. {m.question} (പേജ് നമ്പർ: {p_no + 1})"
+            )
             lines.append(f"A) {m.option_A}")
             lines.append(f"B) {m.option_B}")
             lines.append(f"C) {m.option_C}")
@@ -371,6 +411,7 @@ async def execute_mcq_generation(
     await client.send_document(
         chat_id=chat_id,
         document=out_txt,
+        file_name=f"MCQ_{base_name}.txt",
         caption=f"📝 **Generated Practice MCQs for:** `{file_name}`",
     )
   finally:
@@ -379,9 +420,9 @@ async def execute_mcq_generation(
     await gemini_client.close()
 
 
-# ==========================================
+# ==============================================================================
 # 📖 SUBROUTINE: TEXT EXTRACTION
-# ==========================================
+# ==============================================================================
 async def execute_text_extraction(
     client: Client,
     chat_id: int,
@@ -394,7 +435,8 @@ async def execute_text_extraction(
   await status_msg.edit_text(f"📖 **Extracting text from:** `{file_name}`...")
   gemini_client = await init_gemini_client()
 
-  out_txt = os.path.join(DOWNLOAD_DIR, f"EXTRACT_{file_name}.txt")
+  base_name = os.path.splitext(file_name)[0]
+  out_txt = os.path.join(DOWNLOAD_DIR, f"EXTRACT_{base_name}.txt")
   all_text = []
 
   try:
@@ -404,7 +446,9 @@ async def execute_text_extraction(
         await status_msg.edit_text(
             f"📖 OCR Extraction ({p_no + 1}/{total}) for `{file_name}`..."
         )
-        temp_img = os.path.join(DOWNLOAD_DIR, f"temp_ocr_{p_no}.png")
+        temp_img = os.path.join(
+            DOWNLOAD_DIR, f"temp_ocr_{os.getpid()}_{p_no}.png"
+        )
         doc[p_no].get_pixmap(dpi=200).save(temp_img)
 
         try:
@@ -426,6 +470,7 @@ async def execute_text_extraction(
     await client.send_document(
         chat_id=chat_id,
         document=out_txt,
+        file_name=f"EXTRACT_{base_name}.txt",
         caption=f"📖 **Extracted Text & Tables for:** `{file_name}`",
     )
   finally:
@@ -439,9 +484,10 @@ start_handler = start_cmd
 queue_cmd = check_queue_cmd
 clear_handler = clear_cmd
 done_handler = done_cmd
-document_handler = pdf_handler
-handle_document = pdf_handler
-document_receiver = pdf_handler
-callback_query_handler = callback_handler
-handle_callback = callback_handler
+document_handler = handle_document
+pdf_handler = handle_document
+document_receiver = handle_document
+callback_handler = queue_callbacks
+callback_query_handler = queue_callbacks
+handle_callback = queue_callbacks
 
