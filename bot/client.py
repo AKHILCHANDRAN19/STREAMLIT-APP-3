@@ -17,27 +17,23 @@ logger = logging.getLogger("Telegram_Client_Builder")
 
 
 def build_telegram_client() -> Client:
-  """Configures and registers handlers for the Pyrogram bot client."""
+  """Configures client with single-stream transmission to avoid Python 3.12 socket collisions."""
+  common_args = {
+      "name": "GenAI_Processor_Bot",
+      "api_id": API_ID,
+      "api_hash": API_HASH,
+      "in_memory": True,
+      "parse_mode": ParseMode.MARKDOWN,
+      "workers": 4,
+      "max_concurrent_transmissions": 1,  # CRITICAL: Fixes 'call_exception_handler' socket crash
+  }
+
   if BOT_SESSION:
     logger.info("Initializing Pyrofork client with BOT_SESSION string...")
-    app = Client(
-        "GenAI_Processor_Bot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=BOT_SESSION,
-        in_memory=True,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    app = Client(session_string=BOT_SESSION, **common_args)
   else:
     logger.info("Initializing Pyrofork client with BOT_TOKEN...")
-    app = Client(
-        "GenAI_Processor_Bot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    app = Client(bot_token=BOT_TOKEN, **common_args)
 
   # Attach Handlers
   app.add_handler(MessageHandler(log_incoming_messages), group=-1)
@@ -66,4 +62,3 @@ def build_telegram_client() -> Client:
   )
 
   return app
-
