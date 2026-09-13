@@ -31,7 +31,7 @@ FONT_PATH = os.path.abspath("THUMBA-Bold.ttf")
 
 MAX_PAGES_PER_RUN = 250
 EXTRA_MCQS = 4
-DELAY_BETWEEN_PAGES = 12
+DELAY_BETWEEN_PAGES = 3
 
 
 def get_all_gemini_accounts() -> list[tuple[str, str]]:
