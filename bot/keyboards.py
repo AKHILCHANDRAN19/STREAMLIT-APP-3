@@ -22,19 +22,27 @@ def get_doctype_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_processing_keyboard() -> InlineKeyboardMarkup:
-  """Selection for active processing modes."""
+  """Selection for active processing modes (Gemini WebAPI + Tesseract OCR)."""
   return InlineKeyboardMarkup([
       [
           InlineKeyboardButton(
-              "💎 MCQ Generation", callback_data="run_queue_mcq_gem"
+              "💎 MCQ (Gemini)", callback_data="run_queue_mcq_gem"
           ),
           InlineKeyboardButton(
-              "🌐 Text & Tables", callback_data="run_queue_text_gem"
+              "📄 Text (Tesseract OCR)", callback_data="run_queue_text"
           ),
       ],
       [
           InlineKeyboardButton(
-              "🔥 Both (MCQ + Text)", callback_data="run_queue_both_gem"
+              "🌐 Text & Tables (Gemini)", callback_data="run_queue_text_gem"
+          ),
+          InlineKeyboardButton(
+              "💎 Gem + Gem", callback_data="run_queue_both_gem"
+          ),
+      ],
+      [
+          InlineKeyboardButton(
+              "♻️ Gem + OCR", callback_data="run_queue_both"
           )
       ],
       [InlineKeyboardButton("🗑️ Clear Queue", callback_data="clear_queue")],
@@ -51,4 +59,3 @@ def get_split_keyboard() -> InlineKeyboardMarkup:
       ],
       [InlineKeyboardButton("🗑️ Clear Queue", callback_data="clear_queue")],
   ])
-
