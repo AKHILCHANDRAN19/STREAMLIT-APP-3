@@ -17,7 +17,6 @@ logger = logging.getLogger("Telegram_Client_Builder")
 
 
 def build_telegram_client() -> Client:
-  """Configures client with single-stream transmission to avoid Python 3.12 socket collisions."""
   common_args = {
       "name": "GenAI_Processor_Bot",
       "api_id": API_ID,
@@ -25,7 +24,7 @@ def build_telegram_client() -> Client:
       "in_memory": True,
       "parse_mode": ParseMode.MARKDOWN,
       "workers": 4,
-      "max_concurrent_transmissions": 1,  # CRITICAL: Fixes 'call_exception_handler' socket crash
+      "max_concurrent_transmissions": 1,
   }
 
   if BOT_SESSION:
@@ -56,7 +55,7 @@ def build_telegram_client() -> Client:
       CallbackQueryHandler(
           queue_callbacks,
           filters.regex(
-              r"^(run_queue_mcq_gem|run_queue_text_gem|run_queue_both_gem|clear_queue|set_type_pointwise|set_type_chapter|set_type_split|run_queue_split)$"
+              r"^(run_queue_mcq_gem|run_queue_text_gem|run_queue_both_gem|run_queue_text|run_queue_both|clear_queue|set_type_pointwise|set_type_chapter|set_type_split|run_queue_split)$"
           ),
       )
   )
