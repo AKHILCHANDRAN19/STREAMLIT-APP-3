@@ -4,6 +4,7 @@ import logging
 import os
 import pathlib
 import uuid
+import aiofiles
 from bot.queue_manager import USER_QUEUE
 from config import DELAY_BETWEEN_PAGES, DOWNLOAD_DIR, MAX_PAGES_PER_RUN, TARGET_CHANNEL_ID
 from services.export_service import compile_pdf_with_weasyprint, save_bot_txt
@@ -15,6 +16,7 @@ from services.gemini_service import (
     profile_document_preflight,
     verify_chapter_page,
 )
+from services.ocr_service import extract_text_with_tesseract
 from services.pdf_service import (
     get_pdf_page_count,
     render_page_image,
@@ -38,8 +40,11 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
   channel_active = bool(TARGET_CHANNEL_ID)
 
   try:
-    await status_msg.edit_text("🏁 **Connecting Gemini WebAPI session...**")
-    gem_client = await init_gemini_client()
+    # Only connect Gemini WebAPI if the selected mode actually requires it
+    if mode in ["split", "mcq_gem", "text_gem", "both_gem", "both"]:
+      await status_msg.edit_text("🏁 **Connecting Gemini WebAPI session...**")
+      gem_client = await init_gemini_client()
+
     await status_msg.edit_text(
         f"🏁 **Starting batch of {total_files} file(s) in `{mode.upper()}` mode...**"
     )
@@ -146,7 +151,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
 
         for s_file in split_files:
           sent_doc = await client.send_document(user_id, s_file)
-
           if channel_active and sent_doc and sent_doc.document:
             try:
               await client.send_document(TARGET_CHANNEL_ID, sent_doc.document.file_id)
@@ -168,7 +172,51 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         continue
 
       # ----------------------------------------------------
-      # 📄 MCQ & TEXT EXTRACTION PIPELINES (STATEFUL PER-DOC)
+      # 📄 TESSERACT OCR TEXT EXTRACTION (MALAYALAM & ENGLISH)
+      # ----------------------------------------------------
+      safe_doc_name = os.path.splitext(original_name)[0]
+      ocr_text_path = os.path.join(DOWNLOAD_DIR, f"{safe_doc_name}_OCR.txt")
+
+      if mode in ["text", "both"]:
+        try:
+          await item_status.edit_text(
+              f"🎬 **[{idx}/{total_files}] Processing:** `{original_name}`\n\n🔍 **Extracting text using Tesseract OCR (Malayalam/English)...**"
+          )
+        except Exception:
+          pass
+
+        extracted_ocr = await asyncio.to_thread(extract_text_with_tesseract, file_path)
+        if extracted_ocr:
+          async with aiofiles.open(ocr_text_path, "w", encoding="utf-8") as f:
+            await f.write(extracted_ocr)
+
+        # If OCR-only mode, deliver immediately and move to next file
+        if mode == "text":
+          if os.path.exists(ocr_text_path) and os.path.getsize(ocr_text_path) > 0:
+            caption = f"📄 **Extracted Text (Tesseract OCR)**\n📁 File: `{original_name}`\n👤 User: `{user_id}`"
+            sent_ocr = await client.send_document(user_id, ocr_text_path, caption=caption)
+            if channel_active and sent_ocr and sent_ocr.document:
+              try:
+                await client.send_document(TARGET_CHANNEL_ID, sent_ocr.document.file_id, caption=caption)
+              except Exception:
+                channel_active = False
+
+          for tmp in [file_path, ocr_text_path]:
+            if os.path.exists(tmp):
+              try:
+                os.remove(tmp)
+              except Exception:
+                pass
+
+          try:
+            await item_status.delete()
+            await client.send_sticker(user_id, SUCCESS_STICKER_ID)
+          except Exception as e:
+            logger.warning(f"Sticker dispatch error: {e}")
+          continue
+
+      # ----------------------------------------------------
+      # 📄 MCQ & GEMINI TEXT EXTRACTION PIPELINES
       # ----------------------------------------------------
       total_pages = get_pdf_page_count(file_path)
       if total_pages == 0:
@@ -181,7 +229,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
 
       total_pages = min(total_pages, MAX_PAGES_PER_RUN)
 
-      # Run Pre-flight Profiler on first 3 preview pages
       preview_imgs = render_preview_pages(file_path, DOWNLOAD_DIR, max_pages=3, dpi=150)
       doc_profile = await profile_document_preflight(gem_client, preview_imgs)
       for p in preview_imgs:
@@ -194,10 +241,8 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       out_html_path = os.path.join(DOWNLOAD_DIR, f"{doc_title}.html")
       gem_text_path = os.path.join(DOWNLOAD_DIR, f"{doc_title}_Extracted.txt")
 
-      # Isolated stateful chat session dedicated to this single PDF
       active_chat = gem_client.start_chat(model="gemini-flash-lite")
       all_mcqs = []
-
       start_page = max(1, doc_profile.start_page)
 
       for page_num in range(start_page, total_pages + 1):
@@ -214,7 +259,6 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         render_page_image(file_path, page_num - 1, curr_img, dpi=150)
 
         try:
-          # Mode: Text & Tables Extraction
           if mode in ["text_gem", "both_gem"]:
             page_blocks = await extract_text_and_tables_webapi(gem_client, curr_img, page_num)
             if page_blocks.blocks:
@@ -232,8 +276,7 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
                         f.write(f"• {h_label}: {cell}\n")
                       f.write("------------------\n")
 
-          # Mode: MCQ Generation (Runs in continuous doc session)
-          if mode in ["mcq_gem", "both_gem"]:
+          if mode in ["mcq_gem", "both_gem", "both"]:
             mcq_res = await generate_mcqs_for_page(
                 active_chat, curr_img, page_num, doc_profile=doc_profile, doc_type=doc_type
             )
@@ -255,12 +298,20 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       except Exception:
         pass
 
-      if (
-          mode in ["text_gem", "both_gem"]
-          and os.path.exists(gem_text_path)
-          and os.path.getsize(gem_text_path) > 0
-      ):
-        caption = f"🌐 **Extracted Text & Tables**\n📁 File: `{original_name}`\n👤 User: `{user_id}`"
+      # Deliver OCR Output (Both mode)
+      if mode == "both" and os.path.exists(ocr_text_path) and os.path.getsize(ocr_text_path) > 0:
+        caption = f"📄 **Extracted Text (Tesseract OCR)**\n📁 File: `{original_name}`\n👤 User: `{user_id}`"
+        sent_ocr = await client.send_document(user_id, ocr_text_path, caption=caption)
+        if channel_active and sent_ocr and sent_ocr.document:
+          try:
+            await client.send_document(TARGET_CHANNEL_ID, sent_ocr.document.file_id, caption=caption)
+          except Exception:
+            channel_active = False
+        await asyncio.sleep(1.0)
+
+      # Deliver Gemini WebAPI Text
+      if mode in ["text_gem", "both_gem"] and os.path.exists(gem_text_path) and os.path.getsize(gem_text_path) > 0:
+        caption = f"🌐 **Extracted Text & Tables (Gemini)**\n📁 File: `{original_name}`\n👤 User: `{user_id}`"
         sent_gem = await client.send_document(user_id, gem_text_path, caption=caption)
         if channel_active and sent_gem and sent_gem.document:
           try:
@@ -269,7 +320,8 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
             channel_active = False
         await asyncio.sleep(1.0)
 
-      if mode in ["mcq_gem", "both_gem"] and all_mcqs:
+      # Deliver MCQ Outputs
+      if mode in ["mcq_gem", "both_gem", "both"] and all_mcqs:
         compile_pdf_with_weasyprint(all_mcqs, doc_title, out_pdf_path, out_html_path)
         caption = f"🎬 **MCQ Practice Drill [{idx}/{total_files}]**\n💾 Total Questions: `{len(all_mcqs)}`\n👤 User: `{user_id}`"
 
@@ -300,7 +352,7 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
           )
           await asyncio.sleep(1.0)
 
-      for tmp in [file_path, out_txt_path, out_pdf_path, out_html_path, gem_text_path]:
+      for tmp in [file_path, out_txt_path, out_pdf_path, out_html_path, gem_text_path, ocr_text_path]:
         if os.path.exists(tmp):
           try:
             os.remove(tmp)
@@ -327,4 +379,3 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
         await gem_client.close()
       except Exception:
         pass
-
