@@ -12,7 +12,7 @@ logger = logging.getLogger("OCR_Service")
 def clean_ocr_text(text: str) -> str:
   """Sanitizes raw Tesseract OCR output and normalizes bullet points."""
   text = re.sub(r"(?i)(©\s*entri|e\s*entri|thank\s*you)", "", text)
-  text = re.sub(r"^[ \t]*(```", "", text)
+  text = re.sub(r"^[ \t]*```", "", text)  # Fixed unclosed subpattern
   text = re.sub(
       r"^[ \t]*(൭൫|൭|©|e|@|\*|-|~)[ \t]*", "• ", text, flags=re.MULTILINE
   )
@@ -52,4 +52,3 @@ def extract_text_with_tesseract(file_path: str) -> str:
       logger.error(f"OCR error on PDF: {e}")
 
   return clean_ocr_text(extracted_text)
-
