@@ -9,3 +9,4 @@ gemini-webapi>=2.1.1
 curl_cffi
 Pillow
 requests
+pytesseract
