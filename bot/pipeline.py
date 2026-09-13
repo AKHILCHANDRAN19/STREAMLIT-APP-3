@@ -8,11 +8,11 @@ from bot.queue_manager import USER_QUEUE
 from config import DELAY_BETWEEN_PAGES, DOWNLOAD_DIR, MAX_PAGES_PER_RUN, TARGET_CHANNEL_ID
 from services.export_service import compile_pdf_with_weasyprint, save_bot_txt
 from services.gemini_service import (
-    analyze_document_title,
     extract_table_of_contents,
     extract_text_and_tables_webapi,
     generate_mcqs_for_page,
     init_gemini_client,
+    profile_document_preflight,
     verify_chapter_page,
 )
 from services.pdf_service import (
@@ -30,7 +30,6 @@ SUCCESS_STICKER_ID = (
 
 
 async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
-  """Executes queued items sequentially and dispatches deliverables."""
   queue_files = list(USER_QUEUE.get_files(user_id))
   total_files = len(queue_files)
   doc_type = USER_QUEUE.get_doc_type(user_id) or "pointwise"
@@ -42,8 +41,7 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
     await status_msg.edit_text("🏁 **Connecting Gemini WebAPI session...**")
     gem_client = await init_gemini_client()
     await status_msg.edit_text(
-        f"🏁 **Starting batch of {total_files} file(s) in `{mode.upper()}`"
-        " mode...**"
+        f"🏁 **Starting batch of {total_files} file(s) in `{mode.upper()}` mode...**"
     )
     await asyncio.sleep(1)
 
@@ -67,26 +65,22 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
 
       item_status = await client.send_message(
           user_id,
-          f"🎬 **[{idx}/{total_files}] Processing:** `{original_name}`\n\n⏳"
-          " Initializing document...",
+          f"🎬 **[{idx}/{total_files}] Processing:** `{original_name}`\n\n⏳ Initializing document...",
       )
 
       # ----------------------------------------------------
       # ✂️ SMART CHAPTER SPLIT PIPELINE
       # ----------------------------------------------------
       if mode == "split":
-        await item_status.edit_text(
-            f"🎬 **[{idx}/{total_files}]** `{original_name}`\n\n🔍 **Step 1:**"
-            " Analyzing Table of Contents..."
-        )
-        preview_images = render_preview_pages(
-            file_path, DOWNLOAD_DIR, max_pages=15
-        )
+        try:
+          await item_status.edit_text(
+              f"🎬 **[{idx}/{total_files}]** `{original_name}`\n\n🔍 **Step 1:** Analyzing Table of Contents..."
+          )
+        except Exception:
+          pass
 
+        preview_images = render_preview_pages(file_path, DOWNLOAD_DIR, max_pages=15)
         split_chat = gem_client.start_chat(model="gemini-flash-lite")
-        print(
-            f"[GEMINI API] Split chat locked to: {split_chat.model}", flush=True
-        )
 
         try:
           analysis = await extract_table_of_contents(split_chat, preview_images)
@@ -96,19 +90,20 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
               os.remove(p)
 
         if not analysis.found_index or not analysis.chapters:
-          await item_status.edit_text(
-              f"❌ Could not find Table of Contents in `{original_name}`."
-          )
           try:
+            await item_status.edit_text(f"❌ Could not find Table of Contents in `{original_name}`.")
             await client.send_sticker(user_id, SUCCESS_STICKER_ID)
           except Exception:
             pass
           continue
 
-        await item_status.edit_text(
-            f"🎬 **[{idx}/{total_files}]** `{original_name}`\n\n🔍 **Step 2:**"
-            f" Visually verifying {len(analysis.chapters)} chapter starts..."
-        )
+        try:
+          await item_status.edit_text(
+              f"🎬 **[{idx}/{total_files}]** `{original_name}`\n\n🔍 **Step 2:** Visually verifying {len(analysis.chapters)} chapter starts..."
+          )
+        except Exception:
+          pass
+
         doc_page_count = get_pdf_page_count(file_path)
         current_offset = analysis.offset
         verified = []
@@ -121,14 +116,10 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
           for shift in search_window:
             cand_idx = pred_idx + shift
             if 0 <= cand_idx < doc_page_count:
-              temp_v = os.path.join(
-                  DOWNLOAD_DIR, f"verify_{uuid.uuid4().hex[:6]}.jpg"
-              )
+              temp_v = os.path.join(DOWNLOAD_DIR, f"verify_{uuid.uuid4().hex[:6]}.jpg")
               render_page_image(file_path, cand_idx, temp_v, dpi=150)
               try:
-                if await verify_chapter_page(
-                    split_chat, temp_v, chap.chapter_number, chap.chapter_name
-                ):
+                if await verify_chapter_page(split_chat, temp_v, chap.chapter_number, chap.chapter_name):
                   actual_idx = cand_idx
                   break
               finally:
@@ -144,119 +135,111 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
               "start_index": actual_idx,
           })
 
-        await item_status.edit_text(
-            f"🎬 **[{idx}/{total_files}]** `{original_name}`\n\n✂️ **Step 3:**"
-            " Slicing PDF chapters..."
-        )
-        split_files = split_pdf_by_verified_chapters(
-            file_path, verified, DOWNLOAD_DIR
-        )
+        try:
+          await item_status.edit_text(
+              f"🎬 **[{idx}/{total_files}]** `{original_name}`\n\n✂️ **Step 3:** Slicing PDF chapters..."
+          )
+        except Exception:
+          pass
+
+        split_files = split_pdf_by_verified_chapters(file_path, verified, DOWNLOAD_DIR)
 
         for s_file in split_files:
           sent_doc = await client.send_document(user_id, s_file)
 
-          # Forward via server-side file_id without spamming invalid channels
           if channel_active and sent_doc and sent_doc.document:
             try:
-              await client.send_document(
-                  TARGET_CHANNEL_ID, sent_doc.document.file_id
-              )
+              await client.send_document(TARGET_CHANNEL_ID, sent_doc.document.file_id)
             except Exception as chan_err:
               channel_active = False
-              logger.warning(f"Channel forwarding permanently disabled: {chan_err}")
+              logger.warning(f"Channel forwarding disabled: {chan_err}")
 
           if os.path.exists(s_file):
             os.remove(s_file)
 
-          # TCP media socket cooldown to prevent dropped pipes
-          await asyncio.sleep(1.5)
-
-        await item_status.delete()
+          await asyncio.sleep(1.0)
 
         try:
+          await item_status.delete()
           await client.send_sticker(user_id, SUCCESS_STICKER_ID)
         except Exception as e:
-          logger.warning(f"Could not send success sticker: {e}")
+          logger.warning(f"Sticker dispatch error: {e}")
 
         continue
 
       # ----------------------------------------------------
-      # 📄 MCQ & TEXT EXTRACTION PIPELINES
+      # 📄 MCQ & TEXT EXTRACTION PIPELINES (STATEFUL PER-DOC)
       # ----------------------------------------------------
       total_pages = get_pdf_page_count(file_path)
       if total_pages == 0:
-        await item_status.edit_text(
-            f"❌ Unable to read `{original_name}`. Skipping."
-        )
         try:
+          await item_status.edit_text(f"❌ Unable to read `{original_name}`. Skipping.")
           await client.send_sticker(user_id, SUCCESS_STICKER_ID)
         except Exception:
           pass
         continue
 
       total_pages = min(total_pages, MAX_PAGES_PER_RUN)
-      doc_title = f"Document_{uuid.uuid4().hex[:6]}"
 
-      p1_img = os.path.join(DOWNLOAD_DIR, f"p1_{uuid.uuid4().hex[:6]}.png")
-      render_page_image(file_path, 0, p1_img, dpi=150)
+      # Run Pre-flight Profiler on first 3 preview pages
+      preview_imgs = render_preview_pages(file_path, DOWNLOAD_DIR, max_pages=3, dpi=150)
+      doc_profile = await profile_document_preflight(gem_client, preview_imgs)
+      for p in preview_imgs:
+        if os.path.exists(p):
+          os.remove(p)
 
-      active_chat = gem_client.start_chat(model="gemini-flash-lite")
-      print(
-          f"[GEMINI API] Active chat locked to: {active_chat.model}", flush=True
-      )
-
-      doc_title = await analyze_document_title(active_chat, p1_img)
-      if os.path.exists(p1_img):
-        os.remove(p1_img)
-
+      doc_title = doc_profile.document_title
       out_txt_path = os.path.join(DOWNLOAD_DIR, f"{doc_title}.txt")
       out_pdf_path = os.path.join(DOWNLOAD_DIR, f"{doc_title}.pdf")
       out_html_path = os.path.join(DOWNLOAD_DIR, f"{doc_title}.html")
       gem_text_path = os.path.join(DOWNLOAD_DIR, f"{doc_title}_Extracted.txt")
 
+      # Isolated stateful chat session dedicated to this single PDF
+      active_chat = gem_client.start_chat(model="gemini-flash-lite")
       all_mcqs = []
 
-      for page_num in range(1, total_pages + 1):
-        await item_status.edit_text(
-            f"🎬 **[{idx}/{total_files}] Processing:** `{original_name}`\n\n⚙️"
-            f" **Working on Page {page_num} of {total_pages}**\n📊 MCQs so"
-            f" far: `{len(all_mcqs)}`"
-        )
+      start_page = max(1, doc_profile.start_page)
 
-        curr_img = os.path.join(
-            DOWNLOAD_DIR, f"run_p_{page_num}_{uuid.uuid4().hex[:4]}.png"
-        )
-        render_page_image(file_path, page_num - 1, curr_img, dpi=300)
+      for page_num in range(start_page, total_pages + 1):
+        try:
+          await item_status.edit_text(
+              f"🎬 **[{idx}/{total_files}] Processing:** `{original_name}`\n\n"
+              f"⚙️ **Working on Page {page_num} of {total_pages}**\n"
+              f"📊 MCQs so far: `{len(all_mcqs)}`"
+          )
+        except Exception:
+          pass
+
+        curr_img = os.path.join(DOWNLOAD_DIR, f"run_p_{page_num}_{uuid.uuid4().hex[:4]}.jpg")
+        render_page_image(file_path, page_num - 1, curr_img, dpi=150)
 
         try:
+          # Mode: Text & Tables Extraction
           if mode in ["text_gem", "both_gem"]:
-            page_blocks = await extract_text_and_tables_webapi(
-                gem_client, curr_img, page_num
-            )
-            with open(gem_text_path, "a", encoding="utf-8") as f:
-              f.write(f"\n=== PAGE {page_num} ===\n\n")
-              for b in page_blocks.blocks:
-                if b.block_type == "text" and b.text_content:
-                  f.write(f"{b.text_content.strip()}\n\n")
-                elif b.block_type == "table" and b.table_content:
-                  f.write("--- TABLE ---\n")
-                  hdrs = b.table_content.headers
-                  for row in b.table_content.rows:
-                    for c_idx, cell in enumerate(row.cells):
-                      h_label = (
-                          hdrs[c_idx]
-                          if c_idx < len(hdrs)
-                          else f"Col {c_idx+1}"
-                      )
-                      f.write(f"• {h_label}: {cell}\n")
-                    f.write("------------------\n")
+            page_blocks = await extract_text_and_tables_webapi(gem_client, curr_img, page_num)
+            if page_blocks.blocks:
+              with open(gem_text_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== PAGE {page_num} ===\n\n")
+                for b in page_blocks.blocks:
+                  if b.block_type == "text" and b.text_content:
+                    f.write(f"{b.text_content.strip()}\n\n")
+                  elif b.block_type == "table" and b.table_content:
+                    f.write("--- TABLE ---\n")
+                    hdrs = b.table_content.headers
+                    for row in b.table_content.rows:
+                      for c_idx, cell in enumerate(row.cells):
+                        h_label = hdrs[c_idx] if c_idx < len(hdrs) else f"Col {c_idx+1}"
+                        f.write(f"• {h_label}: {cell}\n")
+                      f.write("------------------\n")
 
+          # Mode: MCQ Generation (Runs in continuous doc session)
           if mode in ["mcq_gem", "both_gem"]:
             mcq_res = await generate_mcqs_for_page(
-                active_chat, curr_img, page_num, doc_type=doc_type
+                active_chat, curr_img, page_num, doc_profile=doc_profile, doc_type=doc_type
             )
-            all_mcqs.extend([m.model_dump() for m in mcq_res.mcqs])
-            save_bot_txt(all_mcqs, out_txt_path)
+            if mcq_res.mcqs:
+              all_mcqs.extend([m.model_dump() for m in mcq_res.mcqs])
+              save_bot_txt(all_mcqs, out_txt_path)
 
         finally:
           if os.path.exists(curr_img):
@@ -267,93 +250,65 @@ async def run_queue_pipeline(client, status_msg, user_id: int, mode: str):
       # ----------------------------------------------------
       # 📤 ARTIFACT DISPATCH & ARCHIVE SYNC
       # ----------------------------------------------------
-      await item_status.edit_text(
-          f"🎬 **[{idx}/{total_files}] Compiling deliverables...**"
-      )
+      try:
+        await item_status.edit_text(f"🎬 **[{idx}/{total_files}] Compiling deliverables...**")
+      except Exception:
+        pass
 
       if (
           mode in ["text_gem", "both_gem"]
           and os.path.exists(gem_text_path)
           and os.path.getsize(gem_text_path) > 0
       ):
-        caption = (
-            f"🌐 **Extracted Text & Tables**\n📁 File: `{original_name}`\n👤"
-            f" User: `{user_id}`"
-        )
-        sent_gem = await client.send_document(
-            user_id, gem_text_path, caption=caption
-        )
+        caption = f"🌐 **Extracted Text & Tables**\n📁 File: `{original_name}`\n👤 User: `{user_id}`"
+        sent_gem = await client.send_document(user_id, gem_text_path, caption=caption)
         if channel_active and sent_gem and sent_gem.document:
           try:
-            await client.send_document(
-                TARGET_CHANNEL_ID, sent_gem.document.file_id, caption=caption
-            )
+            await client.send_document(TARGET_CHANNEL_ID, sent_gem.document.file_id, caption=caption)
           except Exception:
             channel_active = False
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0)
 
       if mode in ["mcq_gem", "both_gem"] and all_mcqs:
-        compile_pdf_with_weasyprint(
-            all_mcqs, doc_title, out_pdf_path, out_html_path
-        )
-        caption = (
-            f"🎬 **MCQ Practice Drill [{idx}/{total_files}]**\n💾 Total"
-            f" Questions: `{len(all_mcqs)}`\n👤 User: `{user_id}`"
-        )
+        compile_pdf_with_weasyprint(all_mcqs, doc_title, out_pdf_path, out_html_path)
+        caption = f"🎬 **MCQ Practice Drill [{idx}/{total_files}]**\n💾 Total Questions: `{len(all_mcqs)}`\n👤 User: `{user_id}`"
 
         if os.path.exists(out_txt_path):
-          sent_txt = await client.send_document(
-              user_id, out_txt_path, caption=caption
-          )
+          sent_txt = await client.send_document(user_id, out_txt_path, caption=caption)
           if channel_active and sent_txt and sent_txt.document:
             try:
-              await client.send_document(
-                  TARGET_CHANNEL_ID, sent_txt.document.file_id, caption=caption
-              )
+              await client.send_document(TARGET_CHANNEL_ID, sent_txt.document.file_id, caption=caption)
             except Exception:
               channel_active = False
-          await asyncio.sleep(1.5)
+          await asyncio.sleep(1.0)
 
         if os.path.exists(out_pdf_path):
           sent_pdf = await client.send_document(
-              user_id,
-              out_pdf_path,
-              caption="🎨 **Formatted Custom Font PDF (+10pt).**",
+              user_id, out_pdf_path, caption="🎨 **Formatted Custom Font PDF (+10pt).**"
           )
           if channel_active and sent_pdf and sent_pdf.document:
             try:
               await client.send_document(
-                  TARGET_CHANNEL_ID,
-                  sent_pdf.document.file_id,
-                  caption=f"🎨 Formatted PDF for User {user_id}",
+                  TARGET_CHANNEL_ID, sent_pdf.document.file_id, caption=f"🎨 Formatted PDF for User {user_id}"
               )
             except Exception:
               channel_active = False
-          await asyncio.sleep(1.5)
+          await asyncio.sleep(1.0)
         elif os.path.exists(out_html_path):
           await client.send_document(
-              user_id,
-              out_html_path,
-              caption="🌐 **HTML Fallback (PDF compile skipped).**",
+              user_id, out_html_path, caption="🌐 **HTML Fallback (PDF compile skipped).**"
           )
-          await asyncio.sleep(1.5)
+          await asyncio.sleep(1.0)
 
-      for tmp in [
-          file_path,
-          out_txt_path,
-          out_pdf_path,
-          out_html_path,
-          gem_text_path,
-      ]:
+      for tmp in [file_path, out_txt_path, out_pdf_path, out_html_path, gem_text_path]:
         if os.path.exists(tmp):
           try:
             os.remove(tmp)
           except Exception:
             pass
 
-      await item_status.delete()
-
       try:
+        await item_status.delete()
         await client.send_sticker(user_id, SUCCESS_STICKER_ID)
       except Exception as e:
         logger.warning(f"Could not send success sticker: {e}")
