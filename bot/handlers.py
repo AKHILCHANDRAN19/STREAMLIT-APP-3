@@ -36,8 +36,7 @@ WELCOME_TEXT = (
     "📥 **How to Use:**\n"
     "1️⃣ Send one or more `.pdf`, images, or `.txt` files.\n"
     "2️⃣ Select Pointwise, Chapter, or Smart Chapter Split for AI processing.\n"
-    "3️⃣ Or click **🛠️ Direct PDF Tools** for Page Nums, Compress, Split, Merge,"
-    " or Image Extraction!"
+    "3️⃣ Or click **🛠️ Direct PDF Tools** for Page Nums, Compress, Split, Merge, or Image Extraction!"
 )
 
 # Tool state management
@@ -154,7 +153,7 @@ async def handle_document(client, message: Message):
   if not is_authorized(user_id):
     return
 
-  # Handle photo uploads for Images-to-PDF tool
+  # Photo handling for Images-to-PDF tool
   if message.photo:
     if user_id not in img2pdf_pools:
       img2pdf_pools[user_id] = []
@@ -392,9 +391,11 @@ async def queue_callbacks(client, callback_query: CallbackQuery):
         "Send the page pattern you want to split:\n"
         "• `1*` (Odd pages: 1, 3, 5...)\n"
         "• `2*` (Even pages: 2, 4, 6...)\n"
-        "• `3*` (Chunks of 3 pages)\n"
-        "• `1-5, 8-10` (Multiple PDFs)\n"
-        "• `1-5, 8-10 /combine` (Combined into ONE PDF)\n\n"
+        "• `3*` or `4*` (Splits into chunks of 3 or 4 pages)\n"
+        "• `2-5` (Extract pages 2 to 5)\n"
+        "• `1, 10, 17` (Creates 3 separate PDFs)\n"
+        "• `1-5, 8-10` (Creates 2 separate PDFs)\n"
+        "• `1-5, 8-10 /combine` (Combines specified pages into ONE PDF)\n\n"
         "Reply with your pattern text:"
     )
     return
@@ -406,10 +407,9 @@ async def queue_callbacks(client, callback_query: CallbackQuery):
     user_tool_states[user_id] = {"action": "toimg"}
     await callback_query.message.edit_text(
         f"🖼️ **PDF to Images: `{fdata['name']}`**\n\n"
-        "Send your request:\n"
+        "Send your conversion request:\n"
         "• Type `all` (Converts all pages to a ZIP)\n"
-        "• Or send pattern like `1*`, `2*`, `1-4` to receive PNG images"
-        " directly.\n\n"
+        "• Or send a pattern: `1*` (Odd), `2*` (Even), `2-5`, `1, 10, 17`\n\n"
         "Reply with your pattern text:"
     )
     return
@@ -495,8 +495,13 @@ async def handle_pattern_text(client, message: Message):
         with zipfile.ZipFile(zip_p, "w", zipfile.ZIP_DEFLATED) as zipf:
           for img in images:
             zipf.write(img, os.path.basename(img))
-            os.remove(img)
-        await client.send_document(user_id, zip_p)
+            if os.path.exists(img):
+              os.remove(img)
+        await client.send_document(
+            user_id,
+            zip_p,
+            caption=f"✅ All Images for `{fdata['name']}` (ZIP Archive)",
+        )
         if os.path.exists(zip_p):
           os.remove(zip_p)
         await status.delete()
@@ -508,16 +513,19 @@ async def handle_pattern_text(client, message: Message):
         images = await asyncio.to_thread(
             extract_pdf_pages_as_images, fdata["path"], targets, DOWNLOAD_DIR
         )
-        for img in images:
-          await client.send_photo(user_id, img)
-          if os.path.exists(img):
-            os.remove(img)
-        await status.delete()
+        if not images:
+          await status.edit_text("❌ No pages matched the pattern.")
+        else:
+          for img in images:
+            await client.send_photo(user_id, img)
+            if os.path.exists(img):
+              os.remove(img)
+          await status.delete()
   except Exception as e:
     await status.edit_text(f"❌ Error: {e}")
 
 
-# Explicit compatibility aliases
+# Explicit compatibility aliases for client.py
 start_handler = start_cmd
 queue_cmd = check_queue_cmd
 clear_handler = clear_cmd
