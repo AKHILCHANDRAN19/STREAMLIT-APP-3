@@ -16,9 +16,8 @@ from pdf_tools import (
     compile_images_into_pdf,
     compress_pdf_file,
     execute_split,
-    extract_pdf_pages_as_images,
+    extract_pdf_to_images,
     merge_pdf_list,
-    parse_split_pattern,
     stamp_page_numbers,
 )
 import pymupdf
@@ -153,7 +152,7 @@ async def handle_document(client, message: Message):
   if not is_authorized(user_id):
     return
 
-  # Photo handling for Images-to-PDF tool
+  # Handle photo uploads for Images-to-PDF tool
   if message.photo:
     if user_id not in img2pdf_pools:
       img2pdf_pools[user_id] = []
@@ -485,42 +484,31 @@ async def handle_pattern_text(client, message: Message):
         await status.delete()
 
     elif action == "toimg":
-      if pattern.lower() == "all":
-        images = await asyncio.to_thread(
-            extract_pdf_pages_as_images, fdata["path"], None, DOWNLOAD_DIR
-        )
-        zip_p = os.path.join(
-            DOWNLOAD_DIR, f"Images_{os.path.splitext(fdata['name'])[0]}.zip"
-        )
-        with zipfile.ZipFile(zip_p, "w", zipfile.ZIP_DEFLATED) as zipf:
-          for img in images:
-            zipf.write(img, os.path.basename(img))
-            if os.path.exists(img):
-              os.remove(img)
+      # Send directly to your extract_pdf_to_images function
+      result = await asyncio.to_thread(
+          extract_pdf_to_images, fdata["path"], pattern, DOWNLOAD_DIR
+      )
+      
+      if isinstance(result, str) and result.endswith(".zip"):
         await client.send_document(
             user_id,
-            zip_p,
+            result,
             caption=f"✅ All Images for `{fdata['name']}` (ZIP Archive)",
         )
-        if os.path.exists(zip_p):
-          os.remove(zip_p)
+        if os.path.exists(result):
+          os.remove(result)
         await status.delete()
-      else:
-        doc = pymupdf.open(fdata["path"])
-        total = doc.page_count
-        doc.close()
-        targets = parse_split_pattern(pattern, total)
-        images = await asyncio.to_thread(
-            extract_pdf_pages_as_images, fdata["path"], targets, DOWNLOAD_DIR
-        )
-        if not images:
+      
+      elif isinstance(result, list):
+        if not result:
           await status.edit_text("❌ No pages matched the pattern.")
         else:
-          for img in images:
+          for img in result:
             await client.send_photo(user_id, img)
             if os.path.exists(img):
               os.remove(img)
           await status.delete()
+
   except Exception as e:
     await status.edit_text(f"❌ Error: {e}")
 
