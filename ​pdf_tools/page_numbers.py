@@ -7,7 +7,6 @@ def stamp_page_numbers(
     margin_right: int = 40,
     margin_bottom: int = 30,
 ) -> str:
-  """Inserts sequential page numbers at the bottom-right corner of each page."""
   doc = pymupdf.open(input_path)
   for index, page in enumerate(doc):
     rect = page.rect
@@ -18,4 +17,3 @@ def stamp_page_numbers(
   doc.save(output_path)
   doc.close()
   return output_path
-
