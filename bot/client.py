@@ -4,6 +4,7 @@ from bot.handlers import (
     clear_cmd,
     done_cmd,
     handle_document,
+    handle_pattern_text,
     log_incoming_messages,
     queue_callbacks,
     start_cmd,
@@ -34,7 +35,7 @@ def build_telegram_client() -> Client:
     logger.info("Initializing Pyrofork client with BOT_TOKEN...")
     app = Client(bot_token=BOT_TOKEN, **common_args)
 
-  # Attach Handlers
+  # Handlers
   app.add_handler(MessageHandler(log_incoming_messages), group=-1)
   app.add_handler(MessageHandler(start_cmd, filters.command("start")))
   app.add_handler(MessageHandler(check_queue_cmd, filters.command("queue")))
@@ -51,13 +52,18 @@ def build_telegram_client() -> Client:
   app.add_handler(
       MessageHandler(handle_document, filters.document | filters.photo)
   )
+
+  # 🆕 Listen for pattern inputs (excluding command keywords)
   app.add_handler(
-      CallbackQueryHandler(
-          queue_callbacks,
-          filters.regex(
-              r"^(run_queue_mcq_gem|run_queue_text_gem|run_queue_both_gem|run_queue_text|run_queue_both|clear_queue|set_type_pointwise|set_type_chapter|set_type_split|run_queue_split)$"
-          ),
+      MessageHandler(
+          handle_pattern_text,
+          filters.text
+          & ~filters.command(["start", "queue", "done", "clear"])
+          & ~filters.regex(r"^(done|Done|clear|Clear)$"),
       )
   )
+
+  # 🆕 Allows both existing run_queue callbacks and new tool callbacks
+  app.add_handler(CallbackQueryHandler(queue_callbacks))
 
   return app
